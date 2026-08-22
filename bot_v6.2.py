@@ -1366,8 +1366,9 @@ async def _play_playlist_all(update: Update, context, playlist_id: int):
                         if temp_file_path and os.path.exists(temp_file_path):
                             try:
                                 os.remove(temp_file_path)
-                            except Exception:
-                                pass
+                                logger.info(f"歌单播放 🗑️ 临时文件已删除: {song['name']}")
+                            except Exception as e:
+                                logger.warning(f"歌单播放 删除临时文件失败: {e}")
 
                 except Exception as e:
                     logger.warning(f"歌单播放 发送失败: {song['name']} - {e}")
@@ -1375,6 +1376,7 @@ async def _play_playlist_all(update: Update, context, playlist_id: int):
                     if temp_file_path and os.path.exists(temp_file_path):
                         try:
                             os.remove(temp_file_path)
+                            logger.info(f"歌单播放 🗑️ 临时文件已删除(异常): {song['name']}")
                         except Exception:
                             pass
 
@@ -1695,8 +1697,9 @@ async def _resume_playlist_play(application, user_id: int, playlist_id: int, son
                     if temp_file_path and os.path.exists(temp_file_path):
                         try:
                             os.remove(temp_file_path)
-                        except Exception:
-                            pass
+                            logger.info(f"歌单续播 🗑️ 临时文件已删除: {song['name']}")
+                        except Exception as e:
+                            logger.warning(f"歌单续播 删除临时文件失败: {e}")
 
             except Exception as e:
                 logger.warning(f"歌单续播 发送失败: {song['name']} - {e}")
@@ -1704,6 +1707,7 @@ async def _resume_playlist_play(application, user_id: int, playlist_id: int, son
                 if temp_file_path and os.path.exists(temp_file_path):
                     try:
                         os.remove(temp_file_path)
+                        logger.info(f"歌单续播 🗑️ 临时文件已删除(异常): {song['name']}")
                     except Exception:
                         pass
 
