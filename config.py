@@ -1,0 +1,79 @@
+"""
+配置文件 - 支持本地部署和云平台部署
+全部从环境变量读取，适配 Render / 本地 / CF隧道 等部署方式
+"""
+
+import os
+
+# Telegram Bot Token
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+
+# 网易云 MUSIC_U cookie
+NETEASE_COOKIE = os.environ.get("NETEASE_COOKIE", "")
+
+# 管理员用户数字 ID
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
+
+# 歌曲音质等级: standard / higher / exhigh / lossless / hires
+MUSIC_QUALITY = os.environ.get("MUSIC_QUALITY", "standard")
+
+# 内联搜索返回结果数量
+INLINE_RESULTS_LIMIT = int(os.environ.get("INLINE_RESULTS_LIMIT", "25"))
+
+# 普通搜索返回数量
+SEARCH_RESULTS_LIMIT = int(os.environ.get("SEARCH_RESULTS_LIMIT", "10"))
+
+# 代理（留空则直连）
+PROXY_URL = os.environ.get("PROXY_URL", "")
+
+# Cloudflare Workers 代理（用于音频代理）
+# 格式: https://your-worker.workers.dev （不要末尾斜杠）
+# 留空则使用本地代理或 Render 代理
+CF_PROXY_URL = os.environ.get("CF_PROXY_URL", "")
+
+# 本地音频代理 URL（CF 隧道地址，用于本地部署）
+# 格式: https://xxx.trycloudflare.com （不要末尾斜杠）
+# 本地部署时，音频通过此 URL 转发
+LOCAL_AUDIO_PROXY = os.environ.get("LOCAL_AUDIO_PROXY", "")
+
+# 音频代理URL（已弃用，保留兼容）
+AUDIO_PROXY_URL = os.environ.get("AUDIO_PROXY_URL", "")
+
+# 内联搜索专用代理URL（已弃用，保留兼容）
+INLINE_PROXY_URL = os.environ.get("INLINE_PROXY_URL", "")
+
+# Webhook 模式配置
+# 云平台会自动设置 RENDER_EXTERNAL_URL 和 PORT
+# 本地部署使用 CF 隧道时，设置为隧道地址
+# 留空则使用 polling 模式（不需要公网 URL）
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", os.environ.get("RENDER_EXTERNAL_URL", ""))
+PORT = int(os.environ.get("PORT", "8080"))
+
+# Upstash Redis（数据持久化）
+# 在 upstash.com 创建 Redis 后，在 Details 页面获取 REST URL 和 Token
+UPSTASH_REDIS_REST_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "")
+UPSTASH_REDIS_REST_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
+
+# 数据库类型：upstash（云端Redis，默认）或 sqlite（本地）
+DB_TYPE = os.environ.get("DB_TYPE", "upstash")
+
+# 部署模式: local / render / auto
+# local: 本地部署，使用本地音频代理
+# render: Render 部署，使用 Render 音频代理
+# auto: 自动检测（有 WEBHOOK_URL 则 webhook，否则 polling）
+DEPLOY_MODE = os.environ.get("DEPLOY_MODE", "auto")
+
+# 默认欢迎语（可通过管理员 /setwelcome 运行时修改，持久化到 Upstash）
+DEFAULT_WELCOME = os.environ.get("DEFAULT_WELCOME", """👋 你好，{username}
+
+此bot由西欧帝制作 @XiOuDi_A 
+有任何建议可以给我留言
+
+📖 使用方法：
+1.   /play 关键词 — 搜索歌曲
+2.  内联搜索：在任意聊天输入 @XiOuDi163_bot 歌曲名
+3.  /playlist 歌单ID/链接 — 播放网易云歌单（仅限私聊）
+
+例如 
+/play 邓紫棋 泡沫
+@XiOuDi163_bot 邓紫棋 泡沫""")
