@@ -4325,6 +4325,7 @@ def main():
                     auto_cache_running = False
 
             # 将函数引用赋值给全局变量
+            global _do_auto_cache_all_func
             _do_auto_cache_all_func = _do_auto_cache_all
             _current_webhook_url = config.WEBHOOK_URL  # 记录当前 URL，用于检测变化
 
