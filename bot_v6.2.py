@@ -274,6 +274,7 @@ playlist_sent_songs = {}
 auto_cache_running = False  # 是否正在执行自动缓存
 auto_cache_enabled = True   # 自动缓存开关
 _do_auto_cache_func = None  # 立即缓存函数引用（在run_server中赋值）
+_do_auto_cache_all_func = None  # 缓存全部榜单函数引用（在run_server中赋值）
 AUTO_CACHE_IDLE_THRESHOLD = 300  # 闲时阈值：5分钟无用户活动视为空闲
 # 闲时缓存的排行榜列表（多个榜单合集，覆盖更多歌曲）
 # 主榜单（优先缓存）
@@ -1812,6 +1813,25 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("⚡ 立即缓存已启动！\n\n正在缓存今日排行榜，有用户活动时自动暂停。")
         else:
             await query.answer("⚠️ 缓存功能未就绪", show_alert=True)
+    elif data == "cache_all_now":
+        # 管理员一键缓存所有榜单
+        if not _is_admin(user.id):
+            await query.answer("⛔ 权限不足", show_alert=True)
+            return
+        if auto_cache_running:
+            await query.answer("🔄 正在缓存中，请稍候...", show_alert=True)
+            return
+        if _do_auto_cache_all_func:
+            last_user_activity = time.time() - 15
+            asyncio.create_task(_do_auto_cache_all_func())
+            await query.answer("🔥 正在缓存全部24个榜单！", show_alert=True)
+            await query.edit_message_text(
+                "🔥 全部榜单缓存已启动！\n\n"
+                f"正在缓存全部 {len(AUTO_CACHE_PLAYLISTS)} 个排行榜（约2400首），有用户活动时自动暂停。\n"
+                "完成后会自动通知。"
+            )
+        else:
+            await query.answer("⚠️ 缓存功能未就绪", show_alert=True)
     elif data == "cache_status_refresh":
         # 刷新缓存状态
         if not _is_admin(user.id):
@@ -1826,6 +1846,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         enabled = "✅ 已开启" if auto_cache_enabled else "❌ 已关闭"
         keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton("⚡ 立即缓存", callback_data="cache_now"),
+            InlineKeyboardButton("🔥 缓存全部榜单", callback_data="cache_all_now"),
+        ],[
             InlineKeyboardButton("🔄 刷新状态", callback_data="cache_status_refresh"),
         ]])
         await query.edit_message_text(
@@ -4146,9 +4168,162 @@ def main():
                 finally:
                     auto_cache_running = False
 
-            # ============================================================
-            # 自动更新 Webhook URL（监控 Cloudflare Tunnel 地址变化）
-            # ============================================================
+            # 一键缓存全部榜单（所有24个排行榜，不按天分配）
+            async def _do_auto_cache_all():
+                global auto_cache_running
+                if auto_cache_running:
+                    return
+                auto_cache_running = True
+                _cache_start = time.time()
+                _admin_id = db.get_admin_id() or config.ADMIN_ID
+                logger.info(f"🔥 一键缓存全部榜单：开始缓存全部{len(AUTO_CACHE_PLAYLISTS)}个排行榜")
+                try:
+                    # 通知管理员开始
+                    if _admin_id:
+                        try:
+                            await application.bot.send_message(
+                                _admin_id,
+                                f"🔥 开始缓存全部 {len(AUTO_CACHE_PLAYLISTS)} 个排行榜...\n"
+                                f"预计约2400首歌曲，有用户活动时自动暂停。"
+                            )
+                        except Exception:
+                            pass
+
+                    # 加载全部榜单歌曲
+                    all_songs = []
+                    seen_ids = set()
+                    _pl_loaded = 0
+                    _redis_key = "auto_cache:songs:all_playlists"
+
+                    # 优先从Redis读取全部榜单缓存
+                    if db.enabled:
+                        cached = db._exec("GET", _redis_key)
+                        if cached:
+                            try:
+                                all_songs = json.loads(cached)
+                                logger.info(f"🔥 全部榜单：从Redis读取{len(all_songs)}首")
+                            except Exception:
+                                all_songs = []
+
+                    if not all_songs:
+                        for pl_idx, pl_id in enumerate(AUTO_CACHE_PLAYLISTS, 1):
+                            if time.time() - last_user_activity < 10:
+                                logger.info(f"🔥 全部榜单：检测到用户活动，暂停加载（已加载{_pl_loaded}/{len(AUTO_CACHE_PLAYLISTS)}个）")
+                                while time.time() - last_user_activity < 10:
+                                    await asyncio.sleep(3)
+                            try:
+                                songs = await asyncio.to_thread(api.get_toplist_songs, pl_id, 100)
+                                if songs:
+                                    _new = 0
+                                    for s in songs:
+                                        if s["id"] not in seen_ids:
+                                            seen_ids.add(s["id"])
+                                            all_songs.append(s)
+                                            _new += 1
+                                    _pl_loaded += 1
+                                    _pl_name = PLAYLIST_NAMES.get(pl_id, f"未知榜({pl_id})")
+                                    logger.info(f"🔥 全部榜单 [{pl_idx}/{len(AUTO_CACHE_PLAYLISTS)}] {_pl_name} 获取{len(songs)}首，新增{_new}首")
+                                await asyncio.sleep(0.5)
+                            except Exception as e:
+                                logger.warning(f"🔥 全部榜单 [{pl_idx}/{len(AUTO_CACHE_PLAYLISTS)}] 获取失败: {e}")
+
+                        # 存入Redis（保留3天）
+                        if all_songs and db.enabled:
+                            try:
+                                db._exec("SET", _redis_key, json.dumps(all_songs, ensure_ascii=False), "EX", 259200)
+                                logger.info(f"🔥 全部榜单：{len(all_songs)}首已存入Redis（保留3天）")
+                            except Exception:
+                                pass
+
+                    logger.info(f"🔥 全部榜单：共{len(all_songs)}首")
+
+                    if not all_songs:
+                        if _admin_id:
+                            await application.bot.send_message(_admin_id, "❌ 全部榜单缓存失败：无法获取歌曲列表")
+                        return
+
+                    # 批量查询已缓存的file_id
+                    _all_ids = [s["id"] for s in all_songs]
+                    _cached_map = db.get_file_ids_batch(_all_ids) if db.enabled else {}
+                    _failed_ids = set()
+                    if db.enabled:
+                        _failed = db._exec("SMEMBERS", "auto_cache:failed")
+                        if _failed:
+                            _failed_ids = set(int(fid) for fid in _failed)
+                    _cached_count = sum(1 for sid in _all_ids if _cached_map.get(sid))
+                    to_cache = [s for s in all_songs if not _cached_map.get(s["id"]) and s["id"] not in _failed_ids]
+                    logger.info(f"🔥 全部榜单：共{len(all_songs)}首，已缓存{_cached_count}首，待缓存{len(to_cache)}首")
+
+                    success = 0
+                    failed = 0
+                    for idx, song in enumerate(to_cache, 1):
+                        # 有用户活动或内联请求则暂停
+                        while time.time() - last_user_activity < 10 or inline_request_active > 0:
+                            await asyncio.sleep(3)
+                        if not auto_cache_enabled:
+                            break
+
+                        try:
+                            caption = f"🔥 全部榜单 {idx}/{len(to_cache)}"
+                            success_flag, file_id, proxy_type = await _send_audio_with_fallback(
+                                None, 8684066933, song,
+                                quality=config.MUSIC_QUALITY,
+                                caption=caption,
+                                use_cache=False,
+                                log_prefix=f"🔥 全部榜单 [{idx}/{len(to_cache)}] ",
+                                bot=application.bot
+                            )
+                            if success_flag and file_id:
+                                success += 1
+                            else:
+                                failed += 1
+                        except Exception as e:
+                            failed += 1
+                            logger.warning(f"🔥 全部榜单 [{idx}/{len(to_cache)}] ❌ {song['name']} - {e}")
+
+                        # 每50首通知一次进度
+                        if idx % 50 == 0 and _admin_id:
+                            try:
+                                await application.bot.send_message(
+                                    _admin_id,
+                                    f"📊 全部榜单缓存进度：{idx}/{len(to_cache)}\n"
+                                    f"✅ 成功{success}首 ❌ 失败{failed}首"
+                                )
+                            except Exception:
+                                pass
+
+                        await asyncio.sleep(3)
+
+                    _total_time = time.time() - _cache_start
+                    _minutes = int(_total_time // 60)
+                    _seconds = int(_total_time % 60)
+                    logger.info(f"🔥 全部榜单缓存完成：✅{success}首 ❌{failed}首 总耗时{_minutes}分{_seconds}秒")
+
+                    # 通知管理员完成
+                    if _admin_id:
+                        try:
+                            await application.bot.send_message(
+                                _admin_id,
+                                f"✅ 全部榜单缓存完成！\n\n"
+                                f"📊 总计：{len(all_songs)}首\n"
+                                f"✅ 成功缓存：{success}首\n"
+                                f"❌ 失败：{failed}首\n"
+                                f"⏱️ 总耗时：{_minutes}分{_seconds}秒"
+                            )
+                        except Exception:
+                            pass
+                except Exception as e:
+                    logger.error(f"🔥 全部榜单缓存异常: {e}")
+                    if _admin_id:
+                        try:
+                            await application.bot.send_message(_admin_id, f"❌ 全部榜单缓存异常: {e}")
+                        except Exception:
+                            pass
+                finally:
+                    auto_cache_running = False
+
+            # 将函数引用赋值给全局变量
+            _do_auto_cache_all_func = _do_auto_cache_all
             _current_webhook_url = config.WEBHOOK_URL  # 记录当前 URL，用于检测变化
 
             def _get_cf_tunnel_url() -> str:
