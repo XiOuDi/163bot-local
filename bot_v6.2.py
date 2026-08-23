@@ -3313,6 +3313,8 @@ async def cmd_cachestatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from telegram import InlineKeyboardMarkup, InlineKeyboardButton
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("⚡ 立即缓存", callback_data="cache_now"),
+        InlineKeyboardButton("🔥 缓存全部榜单", callback_data="cache_all_now"),
+    ],[
         InlineKeyboardButton("🔄 刷新状态", callback_data="cache_status_refresh"),
     ]])
     await update.message.reply_text(
