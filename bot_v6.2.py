@@ -3981,26 +3981,6 @@ def main():
 
             asyncio.create_task(_resume_active_playlists())
 
-            # 定时自动重启（每8小时），Render检测到进程退出后自动重启
-            async def _auto_restart():
-                while True:
-                    await asyncio.sleep(8 * 3600)
-                    try:
-                        logger.info("定时自动重启触发")
-                        try:
-                            await application.bot.send_message(
-                                chat_id=config.ADMIN_ID,
-                                text="🔄 定时自动重启中，约10秒后恢复..."
-                            )
-                        except Exception:
-                            pass
-                        await asyncio.sleep(1)
-                        os._exit(1)
-                    except Exception as e:
-                        logger.error(f"自动重启失败: {e}")
-
-            asyncio.create_task(_auto_restart())
-
             # 闲时自动缓存核心逻辑（可被闲时检测或立即缓存按钮调用）
             async def _do_auto_cache():
                 global auto_cache_running
