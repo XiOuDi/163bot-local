@@ -1274,6 +1274,7 @@ async def _play_playlist_all(update: Update, context, playlist_id: int):
                 cached = db.get_file_id(song["id"])
                 if cached:
                     try:
+                        logger.info(f"歌单播放 📦 使用file_id缓存: {song['name']} - {song['artist']}")
                         msg = await context.bot.send_audio(
                             chat_id=chat_id, audio=cached, caption=caption, parse_mode="HTML"
                         )
@@ -1605,6 +1606,7 @@ async def _resume_playlist_play(application, user_id: int, playlist_id: int, son
             caption = _song_caption(song)
             if cached:
                 try:
+                    logger.info(f"歌单续播 📦 使用file_id缓存: {song['name']} - {song['artist']}")
                     msg = await bot.send_audio(
                         chat_id=chat_id, audio=cached, caption=caption, parse_mode="HTML"
                     )
