@@ -227,10 +227,13 @@ class UpstashDB:
 
     def set_file_id(self, song_id: int, file_id: str):
         self._exec("SET", f"cache:file_id:{song_id}", file_id)
+        # 维护索引集合，用于快速统计数量
+        self._exec("SADD", "cache:file_id:index", str(song_id))
 
     def delete_file_id(self, song_id: int):
         """删除file_id缓存（用于标题不正确的缓存自动清理）"""
         self._exec("DEL", f"cache:file_id:{song_id}")
+        self._exec("SREM", "cache:file_id:index", str(song_id))
 
     # ---- 用户搜索历史（用于闲时缓存扩展） ----
     def add_searched_song(self, song_id: int):
@@ -283,9 +286,14 @@ class UpstashDB:
         return all_keys
 
     def count_file_ids(self) -> int:
-        """统计已缓存的file_id数量（使用SCAN命令）"""
+        """统计已缓存的file_id数量（使用SCARD，O(1)复杂度）"""
+        result = self._exec("SCARD", "cache:file_id:index")
+        if result is not None:
+            return int(result)
+        # 回退：如果索引集合不存在，使用SCAN统计（慢）
         keys = self.scan_keys("cache:file_id:*")
-        return len(keys)
+        # 排除索引集合本身
+        return len([k for k in keys if k != "cache:file_id:index"])
 
     # ---- 管理员管理（主管理员来自环境变量，附加管理员存Redis） ----
     def get_admins(self) -> list:
