@@ -1200,6 +1200,7 @@ async def _play_playlist_all(update: Update, context, playlist_id: int):
         if user_id not in playlist_queue:
             playlist_queue[user_id] = []
         playlist_queue[user_id].append((playlist_id, songs))
+        db.save_playlist_queue(user_id, playlist_queue[user_id])
         queue_pos = len(playlist_queue[user_id])
         current_pl = existing.get("playlist_id", "?")
         current_idx = existing.get("current_index", 0)
@@ -1429,6 +1430,9 @@ async def _play_playlist_all(update: Update, context, playlist_id: int):
             next_playlist_id, next_songs = playlist_queue[user_id].pop(0)
             if not playlist_queue[user_id]:
                 del playlist_queue[user_id]
+                db.clear_playlist_queue(user_id)
+            else:
+                db.save_playlist_queue(user_id, playlist_queue[user_id])
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=f"📋 队列中下一个歌单开始播放：歌单 {next_playlist_id}（共{len(next_songs)}首）"
@@ -1466,6 +1470,7 @@ async def _play_playlist_all_queue(context, chat_id: int, user_id: int, playlist
                 # 清空队列
                 if user_id in playlist_queue:
                     del playlist_queue[user_id]
+                db.clear_playlist_queue(user_id)
                 return
             # 优先级控制
             while time.time() - last_user_activity < 3 or active_search_plays:
@@ -1479,6 +1484,7 @@ async def _play_playlist_all_queue(context, chat_id: int, user_id: int, playlist
                     db.remove_active_playlist(user_id)
                     if user_id in playlist_queue:
                         del playlist_queue[user_id]
+                    db.clear_playlist_queue(user_id)
                     return
             try:
                 # 5秒去重
@@ -1540,6 +1546,9 @@ async def _play_playlist_all_queue(context, chat_id: int, user_id: int, playlist
             next_playlist_id, next_songs = playlist_queue[user_id].pop(0)
             if not playlist_queue[user_id]:
                 del playlist_queue[user_id]
+                db.clear_playlist_queue(user_id)
+            else:
+                db.save_playlist_queue(user_id, playlist_queue[user_id])
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=f"📋 队列中下一个歌单开始播放：歌单 {next_playlist_id}（共{len(next_songs)}首）"
@@ -1733,6 +1742,29 @@ async def _resume_playlist_play(application, user_id: int, playlist_id: int, son
         )
     except Exception:
         pass
+
+    # 检查排队队列，自动播放下一个歌单
+    global playlist_queue
+    if user_id in playlist_queue and playlist_queue[user_id]:
+        next_playlist_id, next_songs = playlist_queue[user_id].pop(0)
+        if not playlist_queue[user_id]:
+            del playlist_queue[user_id]
+            db.clear_playlist_queue(user_id)
+        else:
+            db.save_playlist_queue(user_id, playlist_queue[user_id])
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"📋 队列中下一个歌单开始播放：歌单 {next_playlist_id}（共{len(next_songs)}首）"
+            )
+        except Exception:
+            pass
+        logger.info(f"歌单续播队列：用户={user_id} 下一个歌单={next_playlist_id}({len(next_songs)}首)")
+        # 构造假的 context 对象用于队列播放
+        class _FakeContext:
+            def __init__(self, bot_obj):
+                self.bot = bot_obj
+        await _play_playlist_all_queue(_FakeContext(bot), chat_id, user_id, next_playlist_id, next_songs)
 
 
 # ============================================================
@@ -3964,12 +3996,21 @@ def main():
                             # 从断点处继续播放
                             remaining = songs[current_index:]
                             logger.info(f"歌单续播：用户={user_id} 歌单={playlist_id} 进度={current_index}/{total} 剩余{len(remaining)}首")
+
+                            # 恢复排队歌单到内存
+                            global playlist_queue
+                            queued = db.get_playlist_queue(user_id)
+                            if queued:
+                                playlist_queue[user_id] = queued
+                                logger.info(f"歌单续播：用户={user_id} 恢复{len(queued)}个排队歌单")
+
                             asyncio.create_task(_resume_playlist_play(application, user_id, playlist_id, remaining, current_index, total))
                             # 通知用户
                             try:
+                                queue_info = f"，还有{len(queued)}个歌单排队" if queued else ""
                                 await application.bot.send_message(
                                     chat_id=user_id,
-                                    text=f"▶️ 服务已恢复，继续播放歌单（进度{current_index}/{total}，剩余{len(remaining)}首）"
+                                    text=f"▶️ 服务已恢复，继续播放歌单（进度{current_index}/{total}，剩余{len(remaining)}首{queue_info}）"
                                 )
                             except Exception:
                                 pass

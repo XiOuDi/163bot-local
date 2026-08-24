@@ -202,6 +202,31 @@ class UpstashDB:
         """设置停止歌单播放的标志（管理员停止用户播放）"""
         self._exec("SET", f"playlist:stop:{user_id}", "1", "EX", 60)
 
+    # ---- 歌单排队队列（重启后恢复）----
+    def save_playlist_queue(self, user_id: int, queue: list):
+        """保存用户的歌单排队队列（queue: [(playlist_id, songs), ...]）"""
+        if not queue:
+            self._exec("DEL", f"playlist:queue:{user_id}")
+            return
+        # 只保存 playlist_id 和 songs，songs 可能很大，但 Upstash 支持
+        data = [{"playlist_id": item[0], "songs": item[1]} for item in queue]
+        self._exec("SET", f"playlist:queue:{user_id}", json.dumps(data, ensure_ascii=False), "EX", 86400)
+
+    def get_playlist_queue(self, user_id: int) -> list:
+        """获取用户的歌单排队队列，返回 [(playlist_id, songs), ...]"""
+        result = self._exec("GET", f"playlist:queue:{user_id}")
+        if not result:
+            return []
+        try:
+            data = json.loads(result)
+            return [(item["playlist_id"], item["songs"]) for item in data]
+        except Exception:
+            return []
+
+    def clear_playlist_queue(self, user_id: int):
+        """清空用户的歌单排队队列"""
+        self._exec("DEL", f"playlist:queue:{user_id}")
+
     def check_playlist_stop_flag(self, user_id: int) -> bool:
         """检查是否有停止标志，并清除"""
         exists = self._exec("EXISTS", f"playlist:stop:{user_id}")
