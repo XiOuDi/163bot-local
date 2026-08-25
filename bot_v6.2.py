@@ -2089,6 +2089,12 @@ async def _play_song(update: Update, context: ContextTypes.DEFAULT_TYPE, song_id
             playlist_sent_songs[user.id][song_id] = time.time()
             logger.info(f"播放歌曲 ✅ 发送成功: {song['name']} - {song['artist']}")
             active_search_plays.discard(user.id)
+            # 用户播放后自动添加到缓存队列（后台缓存前20个版本，不限歌手）
+            try:
+                await asyncio.to_thread(db.add_autocache_song, song['name'], song['artist'])
+                logger.info(f"自动缓存：已加入队列 《{song['name']}》- {song['artist']}")
+            except Exception as e:
+                logger.debug(f"自动缓存入队失败: {e}")
             return
 
         finally:
@@ -3687,10 +3693,12 @@ async def cmd_cachesameall(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 stats = db.get_cachesameall_stats()
                 total_unique = stats.get("total", 0)
 
-            # === 生产者-消费者模式（队列在Upstash上）===
+            # === 生产者-消费者模式（队列在Upstash上，每10首一批）===
             search_done = False
+            BATCH_SIZE = 10
 
             async def _search_worker(worker_id):
+                batch_count = 0
                 while True:
                     # 从Upstash取下一个待搜索歌曲
                     item = await asyncio.to_thread(db.pop_next_search_key)
@@ -3703,6 +3711,10 @@ async def cmd_cachesameall(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         await asyncio.sleep(2)
 
                     try:
+                        logger.info(
+                            f"同名补全 🔍 [W{worker_id}] 搜索 "
+                            f"《{info['name']}》- {info['artist']}"
+                        )
                         search_results = await asyncio.to_thread(
                             api.search_songs_simple, f"{info['name']} {info['artist']}", 30
                         )
@@ -3710,35 +3722,54 @@ async def cmd_cachesameall(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         name_clean = info["name"].replace(" ", "").lower()
                         artist_clean = info["artist"].replace(" ", "").lower()
                         new_count = 0
+                        matched_names = []
                         for s in search_results:
                             s_name_clean = s["name"].replace(" ", "").lower()
                             s_artist_clean = s["artist"].replace(" ", "").lower()
                             if name_clean in s_name_clean and artist_clean in s_artist_clean:
-                                # 所有db调用包装到线程，避免阻塞事件循环
                                 has_file = await asyncio.to_thread(db.get_file_id, s["id"])
                                 if not has_file:
                                     await asyncio.to_thread(db.add_pending_song, s)
                                     new_count += 1
+                                    matched_names.append(f"{s['name']}-{s['artist']}")
 
                         if new_count > 0:
                             await asyncio.to_thread(db.incr_cachesameall_stat, "total_new", new_count)
+                            logger.info(
+                                f"同名补全 🆕 [W{worker_id}] 《{info['name']}》"
+                                f"发现{new_count}个新版本: {', '.join(matched_names[:5])}"
+                                + (f" 等{new_count}首" if new_count > 5 else "")
+                            )
+                        else:
+                            logger.debug(
+                                f"同名补全 [W{worker_id}] 《{info['name']}》 无新版本"
+                            )
+
                         await asyncio.to_thread(db.incr_cachesameall_stat, "searched", 1)
                         await asyncio.to_thread(db.touch_cachesameall)
+                        batch_count += 1
 
-                        if new_count > 0 or worker_id == 0:
+                        # 每10首输出一批详细日志
+                        if batch_count % BATCH_SIZE == 0:
                             stats = await asyncio.to_thread(db.get_cachesameall_stats)
-                            searched = stats.get("searched", 0)
-                            if searched % 20 == 0:
-                                pending = await asyncio.to_thread(db.get_pending_count)
-                                logger.info(f"同名补全：搜索进度 {searched}/{total_unique}，待缓存{pending}首")
+                            pending = await asyncio.to_thread(db.get_pending_count)
+                            remaining = await asyncio.to_thread(db.get_remaining_search_count)
+                            logger.info(
+                                f"同名补全 📦 [W{worker_id}] 第{batch_count}批完成 | "
+                                f"总进度 {stats.get('searched',0)}/{total_unique} "
+                                f"(剩余{remaining}) | 待缓存 {pending}首 | "
+                                f"累计发现 {stats.get('total_new',0)}首"
+                            )
                     except Exception as e:
-                        logger.warning(f"同名补全搜索失败 《{info['name']}》: {e}")
+                        logger.warning(f"同名补全 搜索失败 《{info['name']}》: {e}")
                         await asyncio.to_thread(db.incr_cachesameall_stat, "searched", 1)
 
                     await asyncio.sleep(0.3)
 
             async def _cache_worker():
                 cached_count = 0
+                batch_success = 0
+                batch_failed = 0
                 while True:
                     pending_count = await asyncio.to_thread(db.get_pending_count)
                     if search_done and pending_count == 0:
@@ -3753,6 +3784,10 @@ async def cmd_cachesameall(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         await asyncio.sleep(2)
 
                     try:
+                        logger.info(
+                            f"同名补全 📤 缓存中 [{cached_count+1}] "
+                            f"《{song.get('name','?')}》- {song.get('artist','?')}"
+                        )
                         success_flag, file_id, _ = await _send_audio_with_fallback(
                             context, config.ADMIN_ID, song,
                             quality=config.MUSIC_QUALITY,
@@ -3762,19 +3797,38 @@ async def cmd_cachesameall(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         )
                         if success_flag:
                             await asyncio.to_thread(db.incr_cachesameall_stat, "success", 1)
+                            batch_success += 1
+                            logger.info(
+                                f"同名补全 ✅ [{cached_count+1}] "
+                                f"《{song.get('name','?')}》- {song.get('artist','?')}"
+                            )
                         else:
                             await asyncio.to_thread(db.incr_cachesameall_stat, "failed", 1)
+                            batch_failed += 1
+                            logger.warning(
+                                f"同名补全 ❌ [{cached_count+1}] "
+                                f"《{song.get('name','?')}》- {song.get('artist','?')}"
+                            )
                     except Exception as e:
                         await asyncio.to_thread(db.incr_cachesameall_stat, "failed", 1)
-                        logger.warning(f"同名补全缓存失败 {song.get('name','?')}: {e}")
+                        batch_failed += 1
+                        logger.warning(f"同名补全 缓存失败 {song.get('name','?')}: {e}")
 
                     cached_count += 1
                     await asyncio.to_thread(db.touch_cachesameall)
 
-                    if cached_count % 10 == 0:
+                    # 每10首报告一批
+                    if cached_count % BATCH_SIZE == 0:
                         stats = await asyncio.to_thread(db.get_cachesameall_stats)
                         remaining = await asyncio.to_thread(db.get_remaining_search_count)
                         pending = await asyncio.to_thread(db.get_pending_count)
+                        logger.info(
+                            f"同名补全 📊 缓存批次报告 | 本批成功{batch_success} 失败{batch_failed} | "
+                            f"总进度 搜索{stats.get('searched',0)}/{total_unique} 缓存{cached_count} | "
+                            f"待缓存{pending}首"
+                        )
+                        batch_success = 0
+                        batch_failed = 0
                         await context.bot.send_message(
                             config.ADMIN_ID,
                             f"⏳ 同名补全进度：\n"
@@ -4866,6 +4920,108 @@ def main():
             _do_auto_cache_func = _do_auto_cache
 
             asyncio.create_task(_idle_auto_cache())
+
+            # 用户播放自动缓存worker：从Upstash队列取歌，搜索前20版本并缓存
+            async def _autocache_song_worker():
+                await asyncio.sleep(30)  # 启动延迟
+                logger.info("🎵 用户播放自动缓存worker已启动")
+                while True:
+                    try:
+                        # 有用户活动或内联请求时暂停
+                        while time.time() - last_user_activity < 10 or inline_request_active > 0:
+                            await asyncio.sleep(5)
+
+                        # 从Upstash取一首待缓存歌曲
+                        member = await asyncio.to_thread(db.pop_autocache_song)
+                        if not member:
+                            await asyncio.sleep(15)
+                            continue
+
+                        parts = member.split("||", 1)
+                        song_name = parts[0]
+                        song_artist = parts[1] if len(parts) > 1 else ""
+
+                        logger.info(f"自动缓存 ▶ 开始处理 《{song_name}》- {song_artist}")
+
+                        # 搜索前20首（不限歌手）
+                        try:
+                            search_results = await asyncio.to_thread(
+                                api.search_songs_simple, song_name, 20
+                            )
+                        except Exception as e:
+                            logger.warning(f"自动缓存 搜索失败 《{song_name}》: {e}")
+                            await asyncio.sleep(3)
+                            continue
+
+                        if not search_results:
+                            logger.info(f"自动缓存 《{song_name}》 无搜索结果")
+                            continue
+
+                        # 筛选未缓存的
+                        to_cache = []
+                        for s in search_results:
+                            has_file = await asyncio.to_thread(db.get_file_id, s["id"])
+                            if not has_file:
+                                to_cache.append(s)
+
+                        logger.info(
+                            f"自动缓存 《{song_name}》 搜索到{len(search_results)}首，"
+                            f"已缓存{len(search_results)-len(to_cache)}首，待缓存{len(to_cache)}首"
+                        )
+
+                        if not to_cache:
+                            continue
+
+                        # 缓存歌曲（每首间隔2秒，有用户活动则暂停）
+                        success = 0
+                        failed = 0
+                        for idx, song in enumerate(to_cache, 1):
+                            while time.time() - last_user_activity < 10 or inline_request_active > 0:
+                                await asyncio.sleep(5)
+                            try:
+                                logger.info(
+                                    f"自动缓存 [{idx}/{len(to_cache)}] "
+                                    f"《{song['name']}》- {song['artist']} 下载中..."
+                                )
+                                success_flag, file_id, _ = await _send_audio_with_fallback(
+                                    application, config.ADMIN_ID, song,
+                                    quality=config.MUSIC_QUALITY,
+                                    caption=f"自动缓存 {idx}/{len(to_cache)}",
+                                    use_cache=False,
+                                    log_prefix="自动缓存 "
+                                )
+                                if success_flag:
+                                    success += 1
+                                    logger.info(
+                                        f"自动缓存 [{idx}/{len(to_cache)}] ✅ "
+                                        f"《{song['name']}》- {song['artist']}"
+                                    )
+                                else:
+                                    failed += 1
+                                    logger.warning(
+                                        f"自动缓存 [{idx}/{len(to_cache)}] ❌ "
+                                        f"《{song['name']}》- {song['artist']}"
+                                    )
+                            except Exception as e:
+                                failed += 1
+                                logger.warning(
+                                    f"自动缓存 [{idx}/{len(to_cache)}] 异常 "
+                                    f"《{song.get('name','?')}》: {e}"
+                                )
+                            await asyncio.sleep(2)
+
+                        await asyncio.to_thread(db.touch_autocache)
+                        remaining = await asyncio.to_thread(db.get_autocache_queue_count)
+                        logger.info(
+                            f"自动缓存 ▶ 完成 《{song_name}》: "
+                            f"成功{success}首，失败{failed}首，队列剩余{remaining}首"
+                        )
+
+                    except Exception as e:
+                        logger.error(f"自动缓存worker异常: {e}")
+                        await asyncio.sleep(10)
+
+            asyncio.create_task(_autocache_song_worker())
 
             try:
                 while True:

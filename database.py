@@ -425,6 +425,39 @@ class UpstashDB:
         self._exec("DEL", "cachesameall:keys", "cachesameall:pending",
                    "cachesameall:stats", "cachesameall:active")
 
+    # ---- 用户播放自动缓存（播放歌曲后自动缓存前20个版本，持久化重启续传）----
+    def add_autocache_song(self, song_name: str, artist: str = ""):
+        """添加歌曲到自动缓存队列（去重，SET保证不重复）"""
+        member = song_name if not artist else f"{song_name}||{artist}"
+        self._exec("SADD", "autocache:song:queue", member)
+        self._exec("SET", "autocache:song:active", "1", "EX", 86400)
+
+    def pop_autocache_song(self) -> str:
+        """随机取出一个待自动缓存的歌曲，返回 '歌名||歌手' 或 None"""
+        result = self._exec("SRANDMEMBER", "autocache:song:queue")
+        if not result:
+            return None
+        self._exec("SREM", "autocache:song:queue", result)
+        return result
+
+    def get_autocache_queue_count(self) -> int:
+        """获取自动缓存队列长度"""
+        result = self._exec("SCARD", "autocache:song:queue")
+        return int(result) if result else 0
+
+    def is_autocache_active(self) -> bool:
+        """检查自动缓存任务是否活跃"""
+        exists = self._exec("EXISTS", "autocache:song:active")
+        return bool(exists)
+
+    def touch_autocache(self):
+        """刷新自动缓存活跃标志"""
+        self._exec("SET", "autocache:song:active", "1", "EX", 86400)
+
+    def clear_autocache(self):
+        """清除自动缓存任务数据"""
+        self._exec("DEL", "autocache:song:queue", "autocache:song:active")
+
     # ---- 管理员管理（主管理员来自环境变量，附加管理员存Redis） ----
     def get_admins(self) -> list:
         """获取所有附加管理员ID列表"""
