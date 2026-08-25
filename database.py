@@ -17,25 +17,53 @@ class UpstashDB:
         self.token = config.UPSTASH_REDIS_REST_TOKEN
         self.headers = {"Authorization": f"Bearer {self.token}"}
         self.enabled = bool(self.url and self.token)
+        # 使用Session连接池，避免频繁创建连接
+        self.session = requests.Session()
+        self.session.headers.update(self.headers)
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=20, pool_maxsize=20, max_retries=3
+        )
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
 
-    def _exec(self, *args):
-        """执行 Redis 命令（POST 方式，支持中文等任意字符）"""
+    def _exec(self, *args, retries=3):
+        """执行 Redis 命令（POST 方式，支持中文等任意字符），带重试"""
         if not self.enabled:
             return None
-        try:
-            payload = json.dumps(list(args))
-            resp = requests.post(
-                self.url,
-                data=payload,
-                headers=self.headers,
-                timeout=10,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            return data.get("result")
-        except Exception as e:
-            print(f"[Upstash] 命令失败 {args[0]}: {e}")
+        payload = json.dumps(list(args))
+        for attempt in range(retries):
+            try:
+                resp = self.session.post(
+                    self.url, data=payload, timeout=15,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                return data.get("result")
+            except Exception as e:
+                if attempt < retries - 1:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                print(f"[Upstash] 命令失败 {args[0]}: {e}")
+                return None
+
+    def _exec_pipeline(self, commands: list):
+        """批量执行多个Redis命令（Upstash pipeline），commands为命令列表的列表"""
+        if not self.enabled or not commands:
             return None
+        payload = json.dumps(commands)
+        for attempt in range(3):
+            try:
+                resp = self.session.post(
+                    self.url, data=payload, timeout=30,
+                )
+                resp.raise_for_status()
+                return resp.json()
+            except Exception as e:
+                if attempt < 2:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                print(f"[Upstash] pipeline失败 ({len(commands)}条命令): {e}")
+                return None
 
     # ---- 用户集合 ----
     def add_user(self, user_id: int):
@@ -339,12 +367,17 @@ class UpstashDB:
 
     # ---- 同名补全任务持久化（重启后继续）----
     def init_cachesameall(self, unique_songs: dict):
-        """初始化同名补全任务，存储所有待搜索的歌曲"""
+        """初始化同名补全任务，存储所有待搜索的歌曲（批量HSET，每批100首）"""
         # 清除旧数据
         self._exec("DEL", "cachesameall:keys", "cachesameall:pending", "cachesameall:stats")
-        # 存储所有待搜索的歌曲（key -> JSON）
-        for key, info in unique_songs.items():
-            self._exec("HSET", "cachesameall:keys", key, json.dumps(info, ensure_ascii=False))
+        # 批量存储：每100首歌一个HSET命令
+        items = list(unique_songs.items())
+        for i in range(0, len(items), 100):
+            batch = items[i:i+100]
+            hset_args = ["HSET", "cachesameall:keys"]
+            for key, info in batch:
+                hset_args.extend([key, json.dumps(info, ensure_ascii=False)])
+            self._exec(*hset_args)
         # 初始化统计
         self._exec("HSET", "cachesameall:stats",
                    "total", str(len(unique_songs)),
