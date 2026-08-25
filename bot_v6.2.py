@@ -2739,6 +2739,7 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔁 /restart — 重启Render服务（每8小时自动重启一次）\n"
         "📊 /cachetop — 预热热歌榜前100首缓存\n"
         "📋 /cacheplaylist 歌单ID — 缓存指定歌单全部歌曲\n"
+        "🎵 /cachesame 歌曲名 歌手名 — 缓存同一歌手同名歌曲的所有版本\n"
         "👤 /cacheuser 用户ID — 缓存指定网易云账号的所有歌单（漫游歌曲）\n"
         "⏹️ /playliststop — 查看/停止正在播放歌单的用户\n"
         "🔀 /toggleplaylist — 开关歌单播放功能\n"
@@ -3447,6 +3448,158 @@ async def cmd_cacheplaylist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     asyncio.create_task(_do_cache_playlist())
 
 
+async def cmd_cachesame(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """管理员：缓存同一歌手同名歌曲的所有版本（Live/DJ/伴奏等）"""
+    user = update.effective_user
+    if not _is_admin(user.id):
+        await update.message.reply_text("⛔ 权限不足，仅管理员可使用此命令。")
+        return
+
+    arg = " ".join(context.args).strip()
+    if not arg:
+        await update.message.reply_text(
+            "⚠️ 用法：/cachesame 歌曲名 歌手名\n\n"
+            "搜索同一歌手同名歌曲的所有版本（Live版、DJ版、伴奏等）并缓存。\n\n"
+            "示例：/cachesame 泡沫 邓紫棋"
+        )
+        return
+
+    # 解析歌曲名和歌手名（支持 "歌曲名 - 歌手名" 或 "歌曲名 歌手名" 格式）
+    if " - " in arg:
+        parts = arg.split(" - ", 1)
+        song_name = parts[0].strip()
+        artist_name = parts[1].strip()
+    elif "-" in arg and len(arg.split("-")) == 2:
+        parts = arg.split("-", 1)
+        song_name = parts[0].strip()
+        artist_name = parts[1].strip()
+    else:
+        # 按空格分割，最后一个词作为歌手名，其余作为歌曲名
+        parts = arg.split()
+        if len(parts) < 2:
+            await update.message.reply_text("⚠️ 请同时提供歌曲名和歌手名，例如：/cachesame 泡沫 邓紫棋")
+            return
+        artist_name = parts[-1]
+        song_name = " ".join(parts[:-1])
+
+    await update.message.reply_text(f"🔍 正在搜索《{song_name}》- {artist_name} 的所有版本...")
+
+    async def _do_cache_same():
+        try:
+            # 搜索歌曲（多搜一些，最多100首）
+            all_results = []
+            for offset in [0, 50]:
+                songs = await asyncio.to_thread(api.search_songs_simple, song_name, 50)
+                if not songs:
+                    break
+                all_results.extend(songs)
+                if len(songs) < 50:
+                    break
+                await asyncio.sleep(0.3)
+
+            if not all_results:
+                await context.bot.send_message(config.ADMIN_ID, "❌ 未搜索到任何歌曲。")
+                return
+
+            # 筛选同一歌手同名歌曲
+            song_name_clean = song_name.replace(" ", "").lower()
+            artist_name_clean = artist_name.replace(" ", "").lower()
+            matched = []
+            seen_ids = set()
+            for s in all_results:
+                if s["id"] in seen_ids:
+                    continue
+                s_name_clean = s["name"].replace(" ", "").lower()
+                s_artist_clean = s["artist"].replace(" ", "").lower()
+                # 歌曲名匹配（包含歌名）且歌手名匹配（包含歌手名）
+                if song_name_clean in s_name_clean and artist_name_clean in s_artist_clean:
+                    seen_ids.add(s["id"])
+                    matched.append(s)
+
+            if not matched:
+                await context.bot.send_message(
+                    config.ADMIN_ID,
+                    f"❌ 未找到《{song_name}》- {artist_name} 的匹配歌曲。\n"
+                    f"搜索到{len(all_results)}首，但无同一歌手同名版本。"
+                )
+                return
+
+            # 过滤已缓存的
+            to_cache = []
+            for s in matched:
+                if not db.get_file_id(s["id"]):
+                    to_cache.append(s)
+            already = len(matched) - len(to_cache)
+
+            song_list = "\n".join(
+                f"  {i+1}. {s['name']} - {s['artist']} ({s['album']})"
+                for i, s in enumerate(matched[:20])
+            )
+            if len(matched) > 20:
+                song_list += f"\n  ... 等共{len(matched)}首"
+
+            await context.bot.send_message(
+                config.ADMIN_ID,
+                f"🎵 找到{len(matched)}首《{song_name}》- {artist_name} 的版本：\n\n"
+                f"{song_list}\n\n"
+                f"已缓存{already}首，待缓存{len(to_cache)}首，开始处理..."
+            )
+
+            if not to_cache:
+                await context.bot.send_message(config.ADMIN_ID, "✅ 所有版本均已缓存，无需处理。")
+                return
+
+            success = 0
+            failed = 0
+            for idx, song in enumerate(to_cache, 1):
+                # 有用户活动则暂停
+                while time.time() - last_user_activity < 5 or inline_request_active > 0:
+                    await asyncio.sleep(2)
+
+                try:
+                    caption = f"同名缓存 {idx}/{len(to_cache)}"
+                    success_flag, file_id, proxy_type = await _send_audio_with_fallback(
+                        context, config.ADMIN_ID, song,
+                        quality=config.MUSIC_QUALITY,
+                        caption=caption,
+                        use_cache=False,
+                        log_prefix=f"同名缓存 [{idx}/{len(to_cache)}] "
+                    )
+                    if success_flag:
+                        success += 1
+                        logger.info(f"同名缓存 [{idx}/{len(to_cache)}] ✅ {song['name']} - {song['artist']}")
+                    else:
+                        failed += 1
+                except Exception as e:
+                    logger.warning(f"同名缓存失败 {song['name']}: {e}")
+                    failed += 1
+
+                if idx % 5 == 0:
+                    await context.bot.send_message(
+                        config.ADMIN_ID,
+                        f"⏳ 同名缓存进度：{idx}/{len(to_cache)}（成功{success}，失败{failed}）"
+                    )
+                await asyncio.sleep(2)
+
+            await context.bot.send_message(
+                config.ADMIN_ID,
+                f"✅ 同名缓存完成！\n\n"
+                f"🎵 《{song_name}》- {artist_name}\n"
+                f"📊 共找到{len(matched)}个版本\n"
+                f"✅ 成功缓存：{success}首\n"
+                f"❌ 失败：{failed}首\n"
+                f"📦 之前已缓存：{already}首"
+            )
+        except Exception as e:
+            logger.error(f"同名缓存任务失败: {e}")
+            try:
+                await context.bot.send_message(config.ADMIN_ID, f"❌ 同名缓存失败: {e}")
+            except Exception:
+                pass
+
+    asyncio.create_task(_do_cache_same())
+
+
 async def cmd_cacheuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """管理员：缓存指定网易云账号的所有歌单歌曲（漫游歌曲）"""
     user = update.effective_user
@@ -3788,6 +3941,7 @@ def main():
     application.add_handler(CommandHandler("autocache", cmd_autocache))
     application.add_handler(CommandHandler("cachestatus", cmd_cachestatus))
     application.add_handler(CommandHandler("cacheplaylist", cmd_cacheplaylist))
+    application.add_handler(CommandHandler("cachesame", cmd_cachesame))
     application.add_handler(CommandHandler("cacheuser", cmd_cacheuser))
     application.add_handler(CommandHandler("playliststop", cmd_playlist_stop))
     application.add_handler(CommandHandler("toggleplaylist", cmd_toggle_playlist))
