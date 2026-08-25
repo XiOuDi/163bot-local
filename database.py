@@ -337,6 +337,94 @@ class UpstashDB:
                 pass
         return ids
 
+    # ---- 同名补全任务持久化（重启后继续）----
+    def init_cachesameall(self, unique_songs: dict):
+        """初始化同名补全任务，存储所有待搜索的歌曲"""
+        # 清除旧数据
+        self._exec("DEL", "cachesameall:keys", "cachesameall:pending", "cachesameall:stats")
+        # 存储所有待搜索的歌曲（key -> JSON）
+        for key, info in unique_songs.items():
+            self._exec("HSET", "cachesameall:keys", key, json.dumps(info, ensure_ascii=False))
+        # 初始化统计
+        self._exec("HSET", "cachesameall:stats",
+                   "total", str(len(unique_songs)),
+                   "searched", "0",
+                   "total_new", "0",
+                   "success", "0",
+                   "failed", "0")
+        self._exec("SET", "cachesameall:active", "1", "EX", 86400)
+
+    def pop_next_search_key(self) -> tuple:
+        """取出下一个待搜索的歌曲（非原子，但可接受重复），返回 (key, info_dict) 或 None"""
+        # 随机取一个key
+        result = self._exec("HRANDFIELD", "cachesameall:keys")
+        if not result:
+            return None
+        key = result
+        # 获取info
+        info_json = self._exec("HGET", "cachesameall:keys", key)
+        if not info_json:
+            return None
+        # 删除该key（标记为已取出）
+        self._exec("HDEL", "cachesameall:keys", key)
+        try:
+            return key, json.loads(info_json)
+        except Exception:
+            return None
+
+    def get_remaining_search_count(self) -> int:
+        """获取剩余待搜索数量"""
+        result = self._exec("HLEN", "cachesameall:keys")
+        return int(result) if result else 0
+
+    def add_pending_song(self, song: dict):
+        """添加待缓存歌曲到队列"""
+        self._exec("RPUSH", "cachesameall:pending", json.dumps(song, ensure_ascii=False))
+
+    def pop_pending_song(self) -> dict:
+        """取出下一个待缓存歌曲，返回 dict 或 None"""
+        result = self._exec("LPOP", "cachesameall:pending")
+        if not result:
+            return None
+        try:
+            return json.loads(result)
+        except Exception:
+            return None
+
+    def get_pending_count(self) -> int:
+        """获取待缓存队列长度"""
+        result = self._exec("LLEN", "cachesameall:pending")
+        return int(result) if result else 0
+
+    def incr_cachesameall_stat(self, field: str, amount: int = 1):
+        """增加统计计数"""
+        self._exec("HINCRBY", "cachesameall:stats", field, str(amount))
+
+    def get_cachesameall_stats(self) -> dict:
+        """获取任务统计"""
+        result = self._exec("HGETALL", "cachesameall:stats")
+        if not result:
+            return {}
+        # HGETALL 返回 flat array [key1, val1, key2, val2, ...]
+        stats = {}
+        for i in range(0, len(result), 2):
+            stats[result[i]] = int(result[i+1]) if i+1 < len(result) else 0
+        return stats
+
+    def is_cachesameall_active(self) -> bool:
+        """检查是否有未完成的同名补全任务"""
+        exists = self._exec("EXISTS", "cachesameall:active")
+        return bool(exists)
+
+    def touch_cachesameall(self):
+        """刷新任务活跃标志（防止过期）"""
+        self._exec("SET", "cachesameall:active", "1", "EX", 86400)
+
+    def clear_cachesameall(self):
+        """清除同名补全任务数据"""
+        self._exec("DEL", "cachesameall:keys", "cachesameall:pending",
+                   "cachesameall:stats", "cachesameall:active")
+
     # ---- 管理员管理（主管理员来自环境变量，附加管理员存Redis） ----
     def get_admins(self) -> list:
         """获取所有附加管理员ID列表"""
