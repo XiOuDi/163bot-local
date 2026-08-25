@@ -152,6 +152,25 @@ class NeteaseAPI:
         data = {"c": c, "ids": json.dumps(song_ids)}
         return self._post(path, data)
 
+    def get_songs_detail_simple(self, song_ids: list) -> list:
+        """批量获取歌曲详情，返回精简列表（同 search_songs_simple 格式）"""
+        result = self.get_song_detail(song_ids)
+        songs = result.get("songs", [])
+        simple_list = []
+        for s in songs:
+            artists = "/".join(a.get("name", "") for a in s.get("ar", []))
+            album = s.get("al", {}).get("name", "")
+            cover = s.get("al", {}).get("picUrl", "")
+            simple_list.append({
+                "id": s.get("id"),
+                "name": s.get("name", ""),
+                "artist": artists,
+                "album": album,
+                "cover": cover,
+                "duration": s.get("dt", 0),
+            })
+        return simple_list
+
     # ----------------------------------------------------------
     # 歌词
     # ----------------------------------------------------------

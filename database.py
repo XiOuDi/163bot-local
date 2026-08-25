@@ -320,6 +320,23 @@ class UpstashDB:
         # 排除索引集合本身
         return len([k for k in keys if k != "cache:file_id:index"])
 
+    def get_all_cached_song_ids(self) -> list:
+        """获取所有已缓存的歌曲ID列表（从索引集合）"""
+        result = self._exec("SMEMBERS", "cache:file_id:index")
+        if result:
+            return [int(x) for x in result]
+        # 回退：使用SCAN
+        keys = self.scan_keys("cache:file_id:*")
+        ids = []
+        for k in keys:
+            if k == "cache:file_id:index":
+                continue
+            try:
+                ids.append(int(k.replace("cache:file_id:", "")))
+            except ValueError:
+                pass
+        return ids
+
     # ---- 管理员管理（主管理员来自环境变量，附加管理员存Redis） ----
     def get_admins(self) -> list:
         """获取所有附加管理员ID列表"""
