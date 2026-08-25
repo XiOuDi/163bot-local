@@ -3630,7 +3630,7 @@ async def cmd_cachesameall(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if not resuming:
                 # === 新任务：扫描并初始化 ===
-                cached_ids = db.get_all_cached_song_ids()
+                cached_ids = await asyncio.to_thread(db.get_all_cached_song_ids)
                 if not cached_ids:
                     await context.bot.send_message(config.ADMIN_ID, "❌ Upstash中没有已缓存的歌曲。")
                     return
@@ -3673,7 +3673,7 @@ async def cmd_cachesameall(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 total_unique = len(unique_songs)
                 # 初始化Upstash持久化队列
-                db.init_cachesameall(unique_songs)
+                await asyncio.to_thread(db.init_cachesameall, unique_songs)
 
                 await context.bot.send_message(
                     config.ADMIN_ID,
@@ -3714,30 +3714,34 @@ async def cmd_cachesameall(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             s_name_clean = s["name"].replace(" ", "").lower()
                             s_artist_clean = s["artist"].replace(" ", "").lower()
                             if name_clean in s_name_clean and artist_clean in s_artist_clean:
-                                if not db.get_file_id(s["id"]):
+                                # 所有db调用包装到线程，避免阻塞事件循环
+                                has_file = await asyncio.to_thread(db.get_file_id, s["id"])
+                                if not has_file:
                                     await asyncio.to_thread(db.add_pending_song, s)
                                     new_count += 1
 
                         if new_count > 0:
-                            db.incr_cachesameall_stat("total_new", new_count)
-                        db.incr_cachesameall_stat("searched", 1)
-                        db.touch_cachesameall()
+                            await asyncio.to_thread(db.incr_cachesameall_stat, "total_new", new_count)
+                        await asyncio.to_thread(db.incr_cachesameall_stat, "searched", 1)
+                        await asyncio.to_thread(db.touch_cachesameall)
 
-                        searched = db.get_cachesameall_stats().get("searched", 0)
-                        if searched % 20 == 0:
-                            pending = db.get_pending_count()
-                            logger.info(f"同名补全：搜索进度 {searched}/{total_unique}，待缓存{pending}首")
+                        if new_count > 0 or worker_id == 0:
+                            stats = await asyncio.to_thread(db.get_cachesameall_stats)
+                            searched = stats.get("searched", 0)
+                            if searched % 20 == 0:
+                                pending = await asyncio.to_thread(db.get_pending_count)
+                                logger.info(f"同名补全：搜索进度 {searched}/{total_unique}，待缓存{pending}首")
                     except Exception as e:
                         logger.warning(f"同名补全搜索失败 《{info['name']}》: {e}")
-                        # 搜索失败也计数，避免卡住
-                        db.incr_cachesameall_stat("searched", 1)
+                        await asyncio.to_thread(db.incr_cachesameall_stat, "searched", 1)
 
-                    await asyncio.sleep(0.2)
+                    await asyncio.sleep(0.3)
 
             async def _cache_worker():
                 cached_count = 0
                 while True:
-                    if search_done and db.get_pending_count() == 0:
+                    pending_count = await asyncio.to_thread(db.get_pending_count)
+                    if search_done and pending_count == 0:
                         break
 
                     song = await asyncio.to_thread(db.pop_pending_song)
@@ -3757,24 +3761,25 @@ async def cmd_cachesameall(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             log_prefix="同名补全 "
                         )
                         if success_flag:
-                            db.incr_cachesameall_stat("success", 1)
+                            await asyncio.to_thread(db.incr_cachesameall_stat, "success", 1)
                         else:
-                            db.incr_cachesameall_stat("failed", 1)
+                            await asyncio.to_thread(db.incr_cachesameall_stat, "failed", 1)
                     except Exception as e:
-                        db.incr_cachesameall_stat("failed", 1)
+                        await asyncio.to_thread(db.incr_cachesameall_stat, "failed", 1)
                         logger.warning(f"同名补全缓存失败 {song.get('name','?')}: {e}")
 
                     cached_count += 1
-                    db.touch_cachesameall()
+                    await asyncio.to_thread(db.touch_cachesameall)
 
                     if cached_count % 10 == 0:
-                        stats = db.get_cachesameall_stats()
-                        remaining = db.get_remaining_search_count()
+                        stats = await asyncio.to_thread(db.get_cachesameall_stats)
+                        remaining = await asyncio.to_thread(db.get_remaining_search_count)
+                        pending = await asyncio.to_thread(db.get_pending_count)
                         await context.bot.send_message(
                             config.ADMIN_ID,
                             f"⏳ 同名补全进度：\n"
                             f"🔍 搜索：{stats.get('searched',0)}/{total_unique}（剩余{remaining}）\n"
-                            f"📥 待缓存：{db.get_pending_count()}首\n"
+                            f"📥 待缓存：{pending}首\n"
                             f"🆕 发现新版本：{stats.get('total_new',0)}首\n"
                             f"✅ 已缓存：{stats.get('success',0)}首，失败：{stats.get('failed',0)}首"
                         )
@@ -3789,8 +3794,8 @@ async def cmd_cachesameall(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await cache_task
 
             # 完成，清除Upstash任务数据
-            stats = db.get_cachesameall_stats()
-            db.clear_cachesameall()
+            stats = await asyncio.to_thread(db.get_cachesameall_stats)
+            await asyncio.to_thread(db.clear_cachesameall)
 
             await context.bot.send_message(
                 config.ADMIN_ID,
