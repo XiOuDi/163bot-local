@@ -17,6 +17,7 @@ import asyncio
 import logging
 import hashlib
 import requests
+import concurrent.futures
 from datetime import datetime
 from urllib.parse import quote
 
@@ -273,6 +274,9 @@ playlist_sent_songs = {}
 # 闲时自动缓存状态
 auto_cache_running = False  # 是否正在执行自动缓存
 auto_cache_enabled = True   # 自动缓存开关
+
+# 后台缓存任务专用线程池（限制3线程，留出线程给webhook和用户请求）
+_cache_executor = concurrent.futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="cache")
 _do_auto_cache_func = None  # 立即缓存函数引用（在run_server中赋值）
 _do_auto_cache_all_func = None  # 缓存全部榜单函数引用（在run_server中赋值）
 AUTO_CACHE_IDLE_THRESHOLD = 300  # 闲时阈值：5分钟无用户活动视为空闲
@@ -2091,7 +2095,10 @@ async def _play_song(update: Update, context: ContextTypes.DEFAULT_TYPE, song_id
             active_search_plays.discard(user.id)
             # 用户播放后自动添加到缓存队列（后台缓存前20个版本，不限歌手）
             try:
-                await asyncio.to_thread(db.add_autocache_song, song['name'], song['artist'])
+                _loop = asyncio.get_event_loop()
+                await _loop.run_in_executor(
+                    _cache_executor, lambda: db.add_autocache_song(song['name'], song['artist'])
+                )
                 logger.info(f"自动缓存：已加入队列 《{song['name']}》- {song['artist']}")
             except Exception as e:
                 logger.debug(f"自动缓存入队失败: {e}")
@@ -3696,12 +3703,17 @@ async def cmd_cachesameall(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # === 生产者-消费者模式（队列在Upstash上，每10首一批）===
             search_done = False
             BATCH_SIZE = 10
+            loop = asyncio.get_event_loop()
+
+            async def _ct(func, *args):
+                """在专用缓存线程池中执行同步函数"""
+                return await loop.run_in_executor(_cache_executor, lambda: func(*args))
 
             async def _search_worker(worker_id):
                 batch_count = 0
                 while True:
                     # 从Upstash取下一个待搜索歌曲
-                    item = await asyncio.to_thread(db.pop_next_search_key)
+                    item = await _ct(db.pop_next_search_key)
                     if item is None:
                         break
 
@@ -3715,9 +3727,16 @@ async def cmd_cachesameall(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             f"同名补全 🔍 [W{worker_id}] 搜索 "
                             f"《{info['name']}》- {info['artist']}"
                         )
-                        search_results = await asyncio.to_thread(
-                            api.search_songs_simple, f"{info['name']} {info['artist']}", 30
-                        )
+                        # 搜索带重试：空结果时重试1次（避免限流导致漏歌）
+                        search_results = []
+                        for search_attempt in range(2):
+                            search_results = await _ct(
+                                api.search_songs_simple, f"{info['name']} {info['artist']}", 30
+                            )
+                            if search_results:
+                                break
+                            logger.warning(f"同名补全 [W{worker_id}] 搜索为空，重试({search_attempt+1}/2): 《{info['name']}》")
+                            await asyncio.sleep(1)
 
                         name_clean = info["name"].replace(" ", "").lower()
                         artist_clean = info["artist"].replace(" ", "").lower()
@@ -3727,14 +3746,14 @@ async def cmd_cachesameall(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             s_name_clean = s["name"].replace(" ", "").lower()
                             s_artist_clean = s["artist"].replace(" ", "").lower()
                             if name_clean in s_name_clean and artist_clean in s_artist_clean:
-                                has_file = await asyncio.to_thread(db.get_file_id, s["id"])
+                                has_file = await _ct(db.get_file_id, s["id"])
                                 if not has_file:
-                                    await asyncio.to_thread(db.add_pending_song, s)
+                                    await _ct(db.add_pending_song, s)
                                     new_count += 1
                                     matched_names.append(f"{s['name']}-{s['artist']}")
 
                         if new_count > 0:
-                            await asyncio.to_thread(db.incr_cachesameall_stat, "total_new", new_count)
+                            await _ct(db.incr_cachesameall_stat, "total_new", new_count)
                             logger.info(
                                 f"同名补全 🆕 [W{worker_id}] 《{info['name']}》"
                                 f"发现{new_count}个新版本: {', '.join(matched_names[:5])}"
@@ -3745,15 +3764,15 @@ async def cmd_cachesameall(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 f"同名补全 [W{worker_id}] 《{info['name']}》 无新版本"
                             )
 
-                        await asyncio.to_thread(db.incr_cachesameall_stat, "searched", 1)
-                        await asyncio.to_thread(db.touch_cachesameall)
+                        await _ct(db.incr_cachesameall_stat, "searched", 1)
+                        await _ct(db.touch_cachesameall)
                         batch_count += 1
 
                         # 每10首输出一批详细日志
                         if batch_count % BATCH_SIZE == 0:
-                            stats = await asyncio.to_thread(db.get_cachesameall_stats)
-                            pending = await asyncio.to_thread(db.get_pending_count)
-                            remaining = await asyncio.to_thread(db.get_remaining_search_count)
+                            stats = await _ct(db.get_cachesameall_stats)
+                            pending = await _ct(db.get_pending_count)
+                            remaining = await _ct(db.get_remaining_search_count)
                             logger.info(
                                 f"同名补全 📦 [W{worker_id}] 第{batch_count}批完成 | "
                                 f"总进度 {stats.get('searched',0)}/{total_unique} "
@@ -3762,20 +3781,20 @@ async def cmd_cachesameall(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             )
                     except Exception as e:
                         logger.warning(f"同名补全 搜索失败 《{info['name']}》: {e}")
-                        await asyncio.to_thread(db.incr_cachesameall_stat, "searched", 1)
+                        await _ct(db.incr_cachesameall_stat, "searched", 1)
 
-                    await asyncio.sleep(0.3)
+                    await asyncio.sleep(0.5)
 
             async def _cache_worker():
                 cached_count = 0
                 batch_success = 0
                 batch_failed = 0
                 while True:
-                    pending_count = await asyncio.to_thread(db.get_pending_count)
+                    pending_count = await _ct(db.get_pending_count)
                     if search_done and pending_count == 0:
                         break
 
-                    song = await asyncio.to_thread(db.pop_pending_song)
+                    song = await _ct(db.pop_pending_song)
                     if song is None:
                         await asyncio.sleep(2)
                         continue
@@ -3796,32 +3815,32 @@ async def cmd_cachesameall(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             log_prefix="同名补全 "
                         )
                         if success_flag:
-                            await asyncio.to_thread(db.incr_cachesameall_stat, "success", 1)
+                            await _ct(db.incr_cachesameall_stat, "success", 1)
                             batch_success += 1
                             logger.info(
                                 f"同名补全 ✅ [{cached_count+1}] "
                                 f"《{song.get('name','?')}》- {song.get('artist','?')}"
                             )
                         else:
-                            await asyncio.to_thread(db.incr_cachesameall_stat, "failed", 1)
+                            await _ct(db.incr_cachesameall_stat, "failed", 1)
                             batch_failed += 1
                             logger.warning(
                                 f"同名补全 ❌ [{cached_count+1}] "
                                 f"《{song.get('name','?')}》- {song.get('artist','?')}"
                             )
                     except Exception as e:
-                        await asyncio.to_thread(db.incr_cachesameall_stat, "failed", 1)
+                        await _ct(db.incr_cachesameall_stat, "failed", 1)
                         batch_failed += 1
                         logger.warning(f"同名补全 缓存失败 {song.get('name','?')}: {e}")
 
                     cached_count += 1
-                    await asyncio.to_thread(db.touch_cachesameall)
+                    await _ct(db.touch_cachesameall)
 
                     # 每10首报告一批
                     if cached_count % BATCH_SIZE == 0:
-                        stats = await asyncio.to_thread(db.get_cachesameall_stats)
-                        remaining = await asyncio.to_thread(db.get_remaining_search_count)
-                        pending = await asyncio.to_thread(db.get_pending_count)
+                        stats = await _ct(db.get_cachesameall_stats)
+                        remaining = await _ct(db.get_remaining_search_count)
+                        pending = await _ct(db.get_pending_count)
                         logger.info(
                             f"同名补全 📊 缓存批次报告 | 本批成功{batch_success} 失败{batch_failed} | "
                             f"总进度 搜索{stats.get('searched',0)}/{total_unique} 缓存{cached_count} | "
@@ -3839,8 +3858,8 @@ async def cmd_cachesameall(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         )
                     await asyncio.sleep(1.5)
 
-            # 启动5个搜索协程 + 1个缓存协程
-            search_tasks = [asyncio.create_task(_search_worker(i)) for i in range(5)]
+            # 启动3个搜索协程 + 1个缓存协程（专用线程池，留5线程给webhook）
+            search_tasks = [asyncio.create_task(_search_worker(i)) for i in range(3)]
             cache_task = asyncio.create_task(_cache_worker())
 
             await asyncio.gather(*search_tasks)
@@ -3848,8 +3867,8 @@ async def cmd_cachesameall(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await cache_task
 
             # 完成，清除Upstash任务数据
-            stats = await asyncio.to_thread(db.get_cachesameall_stats)
-            await asyncio.to_thread(db.clear_cachesameall)
+            stats = await _ct(db.get_cachesameall_stats)
+            await _ct(db.clear_cachesameall)
 
             await context.bot.send_message(
                 config.ADMIN_ID,
@@ -4925,6 +4944,7 @@ def main():
             async def _autocache_song_worker():
                 await asyncio.sleep(30)  # 启动延迟
                 logger.info("🎵 用户播放自动缓存worker已启动")
+                _loop = asyncio.get_event_loop()
                 while True:
                     try:
                         # 有用户活动或内联请求时暂停
@@ -4932,7 +4952,7 @@ def main():
                             await asyncio.sleep(5)
 
                         # 从Upstash取一首待缓存歌曲
-                        member = await asyncio.to_thread(db.pop_autocache_song)
+                        member = await _loop.run_in_executor(_cache_executor, db.pop_autocache_song)
                         if not member:
                             await asyncio.sleep(15)
                             continue
@@ -4943,11 +4963,16 @@ def main():
 
                         logger.info(f"自动缓存 ▶ 开始处理 《{song_name}》- {song_artist}")
 
-                        # 搜索前20首（不限歌手）
+                        # 搜索前20首（不限歌手），空结果重试1次
+                        search_results = []
                         try:
-                            search_results = await asyncio.to_thread(
-                                api.search_songs_simple, song_name, 20
-                            )
+                            for _sa in range(2):
+                                search_results = await _loop.run_in_executor(
+                                    _cache_executor, lambda: api.search_songs_simple(song_name, 20)
+                                )
+                                if search_results:
+                                    break
+                                await asyncio.sleep(1)
                         except Exception as e:
                             logger.warning(f"自动缓存 搜索失败 《{song_name}》: {e}")
                             await asyncio.sleep(3)
@@ -4960,7 +4985,9 @@ def main():
                         # 筛选未缓存的
                         to_cache = []
                         for s in search_results:
-                            has_file = await asyncio.to_thread(db.get_file_id, s["id"])
+                            has_file = await _loop.run_in_executor(
+                                _cache_executor, lambda sid=s["id"]: db.get_file_id(sid)
+                            )
                             if not has_file:
                                 to_cache.append(s)
 
@@ -5010,8 +5037,8 @@ def main():
                                 )
                             await asyncio.sleep(2)
 
-                        await asyncio.to_thread(db.touch_autocache)
-                        remaining = await asyncio.to_thread(db.get_autocache_queue_count)
+                        await _loop.run_in_executor(_cache_executor, db.touch_autocache)
+                        remaining = await _loop.run_in_executor(_cache_executor, db.get_autocache_queue_count)
                         logger.info(
                             f"自动缓存 ▶ 完成 《{song_name}》: "
                             f"成功{success}首，失败{failed}首，队列剩余{remaining}首"
