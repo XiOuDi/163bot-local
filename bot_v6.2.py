@@ -3620,123 +3620,156 @@ async def cmd_cachesameall(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             logger.info(f"同名补全：Upstash中共有{len(cached_ids)}首已缓存歌曲")
 
-            # 2. 批量获取歌曲详情（每100首一批）
+            # 2. 批量获取歌曲详情（每200首一批，并发获取）
             all_songs_info = []
-            for i in range(0, len(cached_ids), 100):
-                batch = cached_ids[i:i+100]
+            detail_batches = [cached_ids[i:i+200] for i in range(0, len(cached_ids), 200)]
+
+            async def _fetch_detail(batch):
                 try:
-                    songs_info = await asyncio.to_thread(api.get_songs_detail_simple, batch)
-                    all_songs_info.extend(songs_info)
+                    return await asyncio.to_thread(api.get_songs_detail_simple, batch)
                 except Exception as e:
-                    logger.warning(f"同名补全：获取歌曲详情失败 批次{i//100+1}: {e}")
-                await asyncio.sleep(0.3)
+                    logger.warning(f"同名补全：获取歌曲详情失败: {e}")
+                    return []
+
+            detail_results = await asyncio.gather(*[_fetch_detail(b) for b in detail_batches])
+            for r in detail_results:
+                all_songs_info.extend(r)
 
             if not all_songs_info:
                 await context.bot.send_message(config.ADMIN_ID, "❌ 无法获取已缓存歌曲的详情。")
                 return
 
-            # 3. 按"歌手+歌名"去重（同一首歌只搜索一次）
+            # 3. 按"歌手+歌名"去重
             unique_songs = {}
             for s in all_songs_info:
-                # 清理歌名中的版本标记，提取核心歌名
                 core_name = s["name"]
-                # 去掉括号内容用于分组（如"泡沫(Live)"→"泡沫"）
-                import re
                 core_name_clean = re.sub(r'[\(（].*?[\)）]', '', core_name).strip().lower().replace(" ", "")
-                artist_clean = s["artist"].split("/")[0].strip().lower().replace(" ", "")  # 取第一歌手
+                artist_clean = s["artist"].split("/")[0].strip().lower().replace(" ", "")
                 key = f"{artist_clean}:{core_name_clean}"
                 if key not in unique_songs:
                     unique_songs[key] = {
                         "name": re.sub(r'[\(（].*?[\)）]', '', core_name).strip(),
                         "artist": s["artist"].split("/")[0].strip(),
-                        "original_id": s["id"],
                     }
 
+            total_unique = len(unique_songs)
             await context.bot.send_message(
                 config.ADMIN_ID,
                 f"📊 扫描完成：\n"
                 f"已缓存歌曲：{len(cached_ids)}首\n"
-                f"去重后唯一歌曲：{len(unique_songs)}首\n\n"
-                f"开始搜索每首歌的其他版本..."
+                f"去重后唯一歌曲：{total_unique}首\n\n"
+                f"🚀 开始并发搜索+缓存（5线程搜索，1线程缓存）..."
             )
 
-            # 4. 对每首唯一歌曲搜索同名版本
+            # 4. 生产者-消费者模式：并发搜索 + 顺序缓存
+            search_queue = asyncio.Queue()
+            cache_queue = asyncio.Queue()
+
+            # 填充搜索队列
+            for key, info in unique_songs.items():
+                await search_queue.put((key, info))
+
             total_new = 0
             total_success = 0
             total_failed = 0
-            processed = 0
+            searched_count = 0
+            search_done = False
 
-            for key, info in unique_songs.items():
-                processed += 1
-                # 有用户活动则暂停
-                while time.time() - last_user_activity < 5 or inline_request_active > 0:
-                    await asyncio.sleep(2)
+            async def _search_worker(worker_id):
+                nonlocal total_new, searched_count
+                while True:
+                    try:
+                        key, info = search_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
 
-                try:
-                    # 搜索同名歌曲
-                    search_results = await asyncio.to_thread(
-                        api.search_songs_simple, f"{info['name']} {info['artist']}", 30
-                    )
-
-                    # 筛选同一歌手同名歌曲
-                    name_clean = info["name"].replace(" ", "").lower()
-                    artist_clean = info["artist"].replace(" ", "").lower()
-                    matched = []
-                    for s in search_results:
-                        s_name_clean = s["name"].replace(" ", "").lower()
-                        s_artist_clean = s["artist"].replace(" ", "").lower()
-                        if name_clean in s_name_clean and artist_clean in s_artist_clean:
-                            if not db.get_file_id(s["id"]):
-                                matched.append(s)
-
-                    if not matched:
-                        await asyncio.sleep(0.5)
-                        continue
-
-                    total_new += len(matched)
-                    logger.info(f"同名补全 [{processed}/{len(unique_songs)}] 《{info['name']}》- {info['artist']}：发现{len(matched)}个新版本")
-
-                    # 缓存新版本
-                    for idx, song in enumerate(matched, 1):
-                        while time.time() - last_user_activity < 5 or inline_request_active > 0:
-                            await asyncio.sleep(2)
-                        try:
-                            caption = f"同名补全 {processed}/{len(unique_songs)}"
-                            success_flag, file_id, _ = await _send_audio_with_fallback(
-                                context, config.ADMIN_ID, song,
-                                quality=config.MUSIC_QUALITY,
-                                caption=caption,
-                                use_cache=False,
-                                log_prefix=f"同名补全 [{processed}/{len(unique_songs)}] "
-                            )
-                            if success_flag:
-                                total_success += 1
-                            else:
-                                total_failed += 1
-                        except Exception as e:
-                            total_failed += 1
-                            logger.warning(f"同名补全失败 {song['name']}: {e}")
+                    # 有用户活动则暂停
+                    while time.time() - last_user_activity < 5 or inline_request_active > 0:
                         await asyncio.sleep(2)
 
-                    # 每处理10首歌报告一次进度
-                    if processed % 10 == 0:
+                    try:
+                        search_results = await asyncio.to_thread(
+                            api.search_songs_simple, f"{info['name']} {info['artist']}", 30
+                        )
+
+                        name_clean = info["name"].replace(" ", "").lower()
+                        artist_clean = info["artist"].replace(" ", "").lower()
+                        for s in search_results:
+                            s_name_clean = s["name"].replace(" ", "").lower()
+                            s_artist_clean = s["artist"].replace(" ", "").lower()
+                            if name_clean in s_name_clean and artist_clean in s_artist_clean:
+                                if not db.get_file_id(s["id"]):
+                                    await cache_queue.put(s)
+                                    total_new += 1
+
+                        searched_count += 1
+                        if searched_count % 20 == 0:
+                            logger.info(f"同名补全：搜索进度 {searched_count}/{total_unique}，发现{total_new}首待缓存")
+                    except Exception as e:
+                        logger.warning(f"同名补全搜索失败 《{info['name']}》: {e}")
+                    finally:
+                        search_queue.task_done()
+
+                    await asyncio.sleep(0.2)
+
+            async def _cache_worker():
+                nonlocal total_success, total_failed
+                cached_count = 0
+                while True:
+                    if search_done and cache_queue.empty():
+                        break
+                    try:
+                        song = await asyncio.wait_for(cache_queue.get(), timeout=3)
+                    except asyncio.TimeoutError:
+                        continue
+
+                    while time.time() - last_user_activity < 5 or inline_request_active > 0:
+                        await asyncio.sleep(2)
+
+                    try:
+                        success_flag, file_id, _ = await _send_audio_with_fallback(
+                            context, config.ADMIN_ID, song,
+                            quality=config.MUSIC_QUALITY,
+                            caption=f"同名补全 {cached_count+1}",
+                            use_cache=False,
+                            log_prefix="同名补全 "
+                        )
+                        if success_flag:
+                            total_success += 1
+                        else:
+                            total_failed += 1
+                    except Exception as e:
+                        total_failed += 1
+                        logger.warning(f"同名补全缓存失败 {song['name']}: {e}")
+                    finally:
+                        cache_queue.task_done()
+
+                    cached_count += 1
+                    if cached_count % 10 == 0:
                         await context.bot.send_message(
                             config.ADMIN_ID,
-                            f"⏳ 同名补全进度：{processed}/{len(unique_songs)}\n"
+                            f"⏳ 同名补全进度：\n"
+                            f"搜索：{searched_count}/{total_unique}\n"
                             f"发现新版本：{total_new}首\n"
                             f"已缓存：{total_success}首，失败：{total_failed}首"
                         )
+                    await asyncio.sleep(1.5)
 
-                except Exception as e:
-                    logger.warning(f"同名补全搜索失败 《{info['name']}》: {e}")
+            # 启动5个搜索协程 + 1个缓存协程
+            search_tasks = [asyncio.create_task(_search_worker(i)) for i in range(5)]
+            cache_task = asyncio.create_task(_cache_worker())
 
-                await asyncio.sleep(1)
+            # 等待所有搜索完成
+            await asyncio.gather(*search_tasks)
+            search_done = True
+            # 等待缓存完成
+            await cache_task
 
             await context.bot.send_message(
                 config.ADMIN_ID,
                 f"✅ 同名补全完成！\n\n"
                 f"📊 扫描已缓存：{len(cached_ids)}首\n"
-                f"🎵 去重后唯一歌曲：{len(unique_songs)}首\n"
+                f"🎵 去重后唯一歌曲：{total_unique}首\n"
                 f"🆕 发现新版本：{total_new}首\n"
                 f"✅ 成功缓存：{total_success}首\n"
                 f"❌ 失败：{total_failed}首"
