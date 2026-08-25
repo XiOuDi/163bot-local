@@ -3637,16 +3637,18 @@ async def cmd_cachesameall(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 logger.info(f"同名补全：Upstash中共有{len(cached_ids)}首已缓存歌曲")
 
-                # 批量并发获取歌曲详情
+                # 批量并发获取歌曲详情（限制10并发，避免连接池溢出）
                 all_songs_info = []
                 detail_batches = [cached_ids[i:i+200] for i in range(0, len(cached_ids), 200)]
+                detail_sem = asyncio.Semaphore(10)
 
                 async def _fetch_detail(batch):
-                    try:
-                        return await asyncio.to_thread(api.get_songs_detail_simple, batch)
-                    except Exception as e:
-                        logger.warning(f"同名补全：获取歌曲详情失败: {e}")
-                        return []
+                    async with detail_sem:
+                        try:
+                            return await asyncio.to_thread(api.get_songs_detail_simple, batch)
+                        except Exception as e:
+                            logger.warning(f"同名补全：获取歌曲详情失败: {e}")
+                            return []
 
                 detail_results = await asyncio.gather(*[_fetch_detail(b) for b in detail_batches])
                 for r in detail_results:

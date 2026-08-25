@@ -82,6 +82,14 @@ class NeteaseAPI:
     def __init__(self, cookie: str = ""):
         self.session = requests.Session()
         self.session.headers.update(_HEADERS)
+        # 增大连接池，支持高并发请求
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=50,
+            pool_maxsize=50,
+            max_retries=3,
+        )
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
         if cookie:
             self.session.cookies.set("MUSIC_U", cookie, domain=".music.163.com")
         # 额外设置一些必要 cookie
