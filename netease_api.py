@@ -96,6 +96,14 @@ class NeteaseAPI:
         self.session.cookies.set("__remember_me", "true", domain=".music.163.com")
         self.session.cookies.set("NMTID", self._gen_nmtid(), domain=".music.163.com")
 
+        # 无cookie会话（cookie被限流时降级使用）
+        self._nocookie_session = requests.Session()
+        self._nocookie_session.headers.update(_HEADERS)
+        self._nocookie_session.mount("https://", requests.adapters.HTTPAdapter(
+            pool_connections=20, pool_maxsize=20, max_retries=2))
+        self._nocookie_session.mount("http://", requests.adapters.HTTPAdapter(
+            pool_connections=20, pool_maxsize=20, max_retries=2))
+
     @staticmethod
     def _gen_nmtid() -> str:
         return hashlib.md5(random.randbytes(16)).hexdigest()
@@ -124,6 +132,7 @@ class NeteaseAPI:
         """
         搜索歌曲
         返回: {"songs": [...], "songCount": N}
+        cookie被限流(code=405)时自动降级为无cookie搜索
         """
         path = "/weapi/search/get"
         data = {
@@ -132,7 +141,28 @@ class NeteaseAPI:
             "limit": limit,
             "offset": offset,
         }
-        return self._post(path, data)
+        result = self._post(path, data)
+        # cookie被限流时降级为无cookie搜索
+        if result.get("code") == 405:
+            import logging
+            logging.getLogger(__name__).warning("搜索cookie被限流(405)，降级为无cookie搜索")
+            result = self._post_nocookie(path, data)
+        return result
+
+    def _post_nocookie(self, path: str, data: dict) -> dict:
+        """使用无cookie会话发送请求（cookie被限流时降级）"""
+        url = f"{_BASE_URL}{path}"
+        payload = _weapi(data)
+        for attempt in range(3):
+            try:
+                resp = self._nocookie_session.post(url, data=payload, timeout=30)
+                resp.raise_for_status()
+                return resp.json()
+            except Exception:
+                if attempt < 2:
+                    import time
+                    time.sleep(1 * (attempt + 1))
+        return {"code": -1, "result": {"songs": [], "songCount": 0}}
 
     # ----------------------------------------------------------
     # 获取歌曲播放地址
