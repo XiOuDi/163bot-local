@@ -2027,6 +2027,16 @@ async def _play_song(update: Update, context: ContextTypes.DEFAULT_TYPE, song_id
                 if edit:
                     await update.callback_query.delete_message()
                 active_search_plays.discard(user.id)
+                logger.info(f"播放歌曲 ✅ 发送成功: {song['name']} - {song['artist']}")
+                # 用户播放后自动添加到缓存队列（后台缓存前20个版本，不限歌手）
+                try:
+                    _loop = asyncio.get_event_loop()
+                    await _loop.run_in_executor(
+                        _cache_executor, lambda: db.add_autocache_song(song['name'], song['artist'])
+                    )
+                    logger.info(f"自动缓存：已加入队列 《{song['name']}》- {song['artist']}")
+                except Exception as e:
+                    logger.debug(f"自动缓存入队失败: {e}")
                 return
         except Exception as e:
             logger.warning(f"file_id缓存发送失败，回退代理: {e}")
