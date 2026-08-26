@@ -3292,9 +3292,9 @@ async def cmd_cachetop(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     audio_bytes = io.BytesIO(resp.content)
                     audio_bytes = _tag_mp3(audio_bytes, song)
                     filename = f"{song['name']} - {config.MUSIC_QUALITY}.mp3"
-                    # 发送给管理员
+                    # 发送给缓存聊天
                     msg = await context.bot.send_audio(
-                        chat_id=config.ADMIN_ID,
+                        chat_id=8684066933,
                         audio=audio_bytes,
                         filename=filename,
                         title=song["name"],
@@ -3441,7 +3441,7 @@ async def cmd_cacheplaylist(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     # 歌单缓存：CF反向代理 → Render 二级回退
                     caption = f"歌单缓存 {idx}/{len(to_cache)}"
                     success_flag, file_id, proxy_type = await _send_audio_with_fallback(
-                        context, config.ADMIN_ID, song,
+                        context, 8684066933, song,
                         quality=config.MUSIC_QUALITY,
                         caption=caption,
                         use_cache=False,  # 缓存任务不使用file_id缓存（因为就是要缓存）
@@ -3583,7 +3583,7 @@ async def cmd_cachesame(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try:
                     caption = f"同名缓存 {idx}/{len(to_cache)}"
                     success_flag, file_id, proxy_type = await _send_audio_with_fallback(
-                        context, config.ADMIN_ID, song,
+                        context, 8684066933, song,
                         quality=config.MUSIC_QUALITY,
                         caption=caption,
                         use_cache=False,
@@ -3818,7 +3818,7 @@ async def cmd_cachesameall(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             f"《{song.get('name','?')}》- {song.get('artist','?')}"
                         )
                         success_flag, file_id, _ = await _send_audio_with_fallback(
-                            context, config.ADMIN_ID, song,
+                            context, 8684066933, song,
                             quality=config.MUSIC_QUALITY,
                             caption=f"同名补全 {cached_count+1}",
                             use_cache=False,
@@ -3996,7 +3996,7 @@ async def cmd_cacheuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     # 漫游缓存：CF反向代理 → Render 二级回退
                     caption = f"漫游缓存 {idx}/{len(to_cache)}"
                     success_flag, file_id, proxy_type = await _send_audio_with_fallback(
-                        context, config.ADMIN_ID, song,
+                        context, 8684066933, song,
                         quality=config.MUSIC_QUALITY,
                         caption=caption,
                         use_cache=False,  # 缓存任务不使用file_id缓存
@@ -5021,7 +5021,7 @@ def main():
                                     f"《{song['name']}》- {song['artist']} 下载中..."
                                 )
                                 success_flag, file_id, _ = await _send_audio_with_fallback(
-                                    application, config.ADMIN_ID, song,
+                                    application, 8684066933, song,
                                     quality=config.MUSIC_QUALITY,
                                     caption=f"自动缓存 {idx}/{len(to_cache)}",
                                     use_cache=False,
