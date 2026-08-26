@@ -2694,11 +2694,39 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
 
     logger.info(f"内联选择 用户={user_label}(id={user.id}) song_id={song_id} query='{chosen.query}'")
 
-    # 检查是否已缓存
+    # 获取歌曲详情（用于自动缓存队列）
+    try:
+        detail = await asyncio.to_thread(api.get_song_detail, [song_id])
+        songs_detail = detail.get("songs", [])
+        if not songs_detail:
+            return
+        raw_song = songs_detail[0]
+        song = {
+            "id": raw_song.get("id", song_id),
+            "name": raw_song.get("name", "未知歌曲"),
+            "artist": "/".join([a.get("name", "") for a in raw_song.get("ar", []) if a.get("name")]) or "未知艺术家",
+            "album": (raw_song.get("al") or {}).get("name", "未知专辑"),
+            "duration": raw_song.get("dt", 0),
+        }
+    except Exception as e:
+        logger.warning(f"内联选择 获取歌曲详情失败: {e}")
+        return
+
+    # 内联播放后自动加入缓存队列（后台缓存前20个版本，不限歌手）
+    try:
+        _loop = asyncio.get_event_loop()
+        await _loop.run_in_executor(
+            _cache_executor, lambda: db.add_autocache_song(song['name'], song['artist'])
+        )
+        logger.info(f"自动缓存：已加入队列 《{song['name']}》- {song['artist']}")
+    except Exception as e:
+        logger.debug(f"自动缓存入队失败: {e}")
+
+    # 检查是否已缓存file_id，已缓存则无需重复缓存
     if await asyncio.to_thread(db.get_file_id, song_id):
         return
 
-    # 获取播放地址并缓存
+    # 未缓存：获取播放地址并缓存
     try:
         url_result = await asyncio.to_thread(api.get_song_url, [song_id], level=db.get_quality())
         url = None
@@ -2708,21 +2736,7 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
                 break
         if not url:
             return
-        # 获取歌曲详情
-        detail = await asyncio.to_thread(api.get_song_detail, [song_id])
-        songs_detail = detail.get("songs", [])
-        if not songs_detail:
-            return
-        raw_song = songs_detail[0]
-        # 统一转换为标准格式（兼容网易云API原始字段 ar/al/dt）
-        song = {
-            "id": raw_song.get("id", song_id),
-            "name": raw_song.get("name", "未知歌曲"),
-            "artist": "/".join([a.get("name", "") for a in raw_song.get("ar", []) if a.get("name")]) or "未知艺术家",
-            "album": (raw_song.get("al") or {}).get("name", "未知专辑"),
-            "duration": raw_song.get("dt", 0),
-        }
-        # 后台缓存到管理员
+        # 后台缓存到缓存聊天
         asyncio.create_task(_cache_song_to_admin(context, song, url))
     except Exception as e:
         logger.warning(f"chosen_inline_result 缓存失败: {e}")
