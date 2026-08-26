@@ -421,6 +421,18 @@ def _song_caption(song: dict) -> str:
     )
 
 
+async def _add_to_autocache_queue(song):
+    """将歌曲加入后台自动缓存队列（缓存前20个版本，不限歌手）"""
+    try:
+        _loop = asyncio.get_event_loop()
+        await _loop.run_in_executor(
+            _cache_executor, lambda: db.add_autocache_song(song['name'], song['artist'])
+        )
+        logger.info(f"自动缓存：已加入队列 《{song['name']}》- {song['artist']}")
+    except Exception as e:
+        logger.debug(f"自动缓存入队失败: {e}")
+
+
 async def _send_audio_with_fallback(context, chat_id, song, quality="standard", caption=None, 
                                       message_thread_id=None, use_cache=True, log_prefix="", bot=None,
                                       user_id=None):
@@ -1297,6 +1309,7 @@ async def _play_playlist_all(update: Update, context, playlist_id: int):
                         else:
                             success += 1
                             db.update_playlist_index(user_id, idx)
+                            asyncio.create_task(_add_to_autocache_queue(song))
                             await asyncio.sleep(1)
                             continue
                     except Exception as e:
@@ -1363,6 +1376,7 @@ async def _play_playlist_all(update: Update, context, playlist_id: int):
                         sent = True
                         success += 1
                         logger.info(f"歌单播放 ✅ 发送成功: {song['name']}")
+                        asyncio.create_task(_add_to_autocache_queue(song))
 
                     finally:
                         if temp_fd is not None:
@@ -1511,6 +1525,7 @@ async def _play_playlist_all_queue(context, chat_id: int, user_id: int, playlist
                 playlist_sent_songs[user_id][song["id"]] = time.time()
                 if success_flag:
                     success += 1
+                    asyncio.create_task(_add_to_autocache_queue(song))
                 else:
                     failed += 1
                 db.update_playlist_index(user_id, idx)
@@ -1637,6 +1652,7 @@ async def _resume_playlist_play(application, user_id: int, playlist_id: int, son
                     else:
                         success += 1
                         db.update_playlist_index(user_id, idx)
+                        asyncio.create_task(_add_to_autocache_queue(song))
                         await asyncio.sleep(1)
                         continue
                 except Exception as e:
@@ -1703,6 +1719,7 @@ async def _resume_playlist_play(application, user_id: int, playlist_id: int, son
                     sent = True
                     success += 1
                     logger.info(f"歌单续播 ✅ 发送成功: {song['name']}")
+                    asyncio.create_task(_add_to_autocache_queue(song))
 
                 finally:
                     if temp_fd is not None:
