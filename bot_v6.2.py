@@ -4983,14 +4983,30 @@ def main():
 
             # 用户播放自动缓存worker：从Upstash队列取歌，搜索前20版本并缓存
             async def _autocache_song_worker():
-                await asyncio.sleep(30)  # 启动延迟
+                await asyncio.sleep(5)  # 启动延迟（从30秒缩短到5秒）
                 logger.info("🎵 用户播放自动缓存worker已启动")
                 _loop = asyncio.get_event_loop()
+                _queue_wait_start = None  # 队列中有歌但被用户活动阻塞的开始时间
                 while True:
                     try:
-                        # 有用户活动或内联请求时暂停
-                        while time.time() - last_user_activity < 10 or inline_request_active > 0:
-                            await asyncio.sleep(5)
+                        # 有用户活动或内联请求时暂停（阈值从10秒缩短到5秒）
+                        # 但如果队列等待超过60秒，强制处理（避免用户一直活跃导致永远不缓存）
+                        _blocked = time.time() - last_user_activity < 5 or inline_request_active > 0
+                        if _blocked:
+                            if _queue_wait_start is None:
+                                # 检查队列是否有歌
+                                _qcount = await _loop.run_in_executor(_cache_executor, db.get_autocache_queue_count)
+                                if _qcount > 0:
+                                    _queue_wait_start = time.time()
+                                    logger.info(f"自动缓存 ⏸️ 用户活动中，队列有{_qcount}首等待，最多60秒后强制处理")
+                            elif time.time() - _queue_wait_start > 60:
+                                logger.info("自动缓存 ⏰ 队列等待超过60秒，强制开始处理（即使用户活跃）")
+                                _queue_wait_start = None
+                            else:
+                                await asyncio.sleep(5)
+                                continue
+                        else:
+                            _queue_wait_start = None
 
                         # 从Upstash取一首待缓存歌曲
                         member = await _loop.run_in_executor(_cache_executor, db.pop_autocache_song)
@@ -5040,12 +5056,16 @@ def main():
                         if not to_cache:
                             continue
 
-                        # 缓存歌曲（每首间隔2秒，有用户活动则暂停）
+                        # 缓存歌曲（每首间隔2秒，有用户活动则暂停，最多等60秒）
                         success = 0
                         failed = 0
                         for idx, song in enumerate(to_cache, 1):
-                            while time.time() - last_user_activity < 10 or inline_request_active > 0:
+                            _song_wait = 0
+                            while (time.time() - last_user_activity < 5 or inline_request_active > 0) and _song_wait < 60:
                                 await asyncio.sleep(5)
+                                _song_wait += 5
+                            if _song_wait >= 60:
+                                logger.info(f"自动缓存 ⏰ 等待用户空闲超过60秒，强制继续缓存")
                             try:
                                 logger.info(
                                     f"自动缓存 [{idx}/{len(to_cache)}] "
