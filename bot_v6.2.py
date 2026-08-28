@@ -860,6 +860,14 @@ async def cmd_play(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _register_user(user.id)
     user_label = f"{user.username or user.first_name or user.id}"
     logger.info(f"/play 用户={user_label}(id={user.id}) 关键词='{keyword}'")
+
+    # 如果输入是纯数字，按歌曲ID直接播放
+    if keyword.isdigit():
+        song_id = int(keyword)
+        logger.info(f"/play 数字ID直接播放: song_id={song_id}")
+        await _play_song(update, context, song_id)
+        return
+
     await _do_search(update, context, keyword)
 
 
@@ -2437,7 +2445,7 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
             InlineQueryResultArticle(
                 id="tip",
                 title="输入歌曲名或歌手名开始搜索",
-                description="例如：邓紫棋 泡沫",
+                description="例如：邓紫棋 泡沫，或直接输入歌曲数字ID",
                 input_message_content=InputTextMessageContent(
                     "🎵 在输入框中继续输入歌曲名即可搜索~"
                 ),
@@ -2446,6 +2454,58 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.answer(results, cache_time=1)
         asyncio.create_task(_dec_inline_active())
         return
+
+    # 如果输入是纯数字，按歌曲ID直接获取并返回
+    if keyword.isdigit():
+        song_id = int(keyword)
+        logger.info(f"内联搜索 数字ID直接查询: song_id={song_id}")
+        try:
+            detail = await asyncio.to_thread(api.get_song_detail, [song_id])
+            songs_detail = detail.get("songs", [])
+            if songs_detail:
+                raw = songs_detail[0]
+                song = {
+                    "id": raw.get("id", song_id),
+                    "name": raw.get("name", "未知歌曲"),
+                    "artist": "/".join([a.get("name", "") for a in raw.get("ar", []) if a.get("name")]) or "未知艺术家",
+                    "album": (raw.get("al") or {}).get("name", "未知专辑"),
+                    "duration": raw.get("dt", 0),
+                    "cover": (raw.get("al") or {}).get("picUrl", ""),
+                }
+                bot_username = context.bot.username or ""
+                via_line = f"\n\n🤖 via @{bot_username}" if bot_username else ""
+                # 检查file_id缓存
+                cached_fid = await asyncio.to_thread(db.get_file_id, song_id)
+                if cached_fid:
+                    result_id = f"fid_{song_id}"
+                    results = [InlineQueryResultCachedAudio(
+                        id=result_id,
+                        audio_file_id=cached_fid,
+                        caption=f"🎵 {song['name']} - {song['artist']}{via_line}",
+                        parse_mode="HTML",
+                    )]
+                    logger.info(f"内联搜索 ID查询 缓存命中: {song['name']}")
+                else:
+                    # 使用本地代理URL
+                    proxy_url = f"{config.WEBHOOK_URL.rstrip('/')}/audio/{song_id}?quality={config.MUSIC_QUALITY}"
+                    result_id = f"url_{song_id}"
+                    results = [InlineQueryResultAudio(
+                        id=result_id,
+                        audio_url=proxy_url,
+                        title=song["name"],
+                        performer=song["artist"],
+                        audio_duration=song["duration"] // 1000 if song.get("duration") else None,
+                        caption=f"🎵 {song['name']} - {song['artist']}{via_line}",
+                        parse_mode="HTML",
+                    )]
+                    logger.info(f"内联搜索 ID查询 代理: {song['name']} -> {proxy_url[:80]}...")
+                await query.answer(results, cache_time=0, is_personal=True)
+                asyncio.create_task(_dec_inline_active())
+                return
+            else:
+                logger.info(f"内联搜索 ID查询 无结果: song_id={song_id}")
+        except Exception as e:
+            logger.warning(f"内联搜索 ID查询失败: {e}")
 
     # 防抖：纯字母输入（4-8位等待100ms防抖，期间有新输入则跳过）- 优化：从300ms减少到100ms
     is_pure_letters = keyword.isascii() and any(c.isalpha() for c in keyword) and not any(c.isspace() for c in keyword) and not any(c.isdigit() for c in keyword)
@@ -2696,11 +2756,13 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
         active_search_plays.discard(user.id)
     asyncio.create_task(_clear_inline_flag())
 
-    # 未缓存歌曲的result_id以 "cf_" (CF代理) 或 "url_" (Render代理) 开头
+    # result_id前缀: "cf_" (CF代理), "url_" (本地/Render代理), "fid_" (file_id缓存)
     rid = chosen.result_id
     if rid.startswith("cf_"):
         song_id_str = rid[3:]
     elif rid.startswith("url_"):
+        song_id_str = rid[4:]
+    elif rid.startswith("fid_"):
         song_id_str = rid[4:]
     else:
         return
@@ -2738,6 +2800,10 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
         logger.info(f"自动缓存：已加入队列 《{song['name']}》- {song['artist']}")
     except Exception as e:
         logger.debug(f"自动缓存入队失败: {e}")
+
+    # file_id缓存的歌曲已由Telegram直接发送，无需重复缓存
+    if rid.startswith("fid_"):
+        return
 
     # 检查是否已缓存file_id，已缓存则无需重复缓存
     if await asyncio.to_thread(db.get_file_id, song_id):
