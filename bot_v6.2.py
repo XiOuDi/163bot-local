@@ -3462,12 +3462,11 @@ async def cmd_togglesongcache(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("⛔ 权限不足。")
         return
     autocache_song_enabled = not autocache_song_enabled
-    status = "✅ 已开启" if autocache_song_enabled else "❌ 已关闭"
+    status = "✅ 已开启" if autocache_song_enabled else "❌ 已暂停"
     await update.message.reply_text(
         f"🎵 用户播放自动缓存其他版本{status}\n\n"
-        f"开启后：用户通过任何方式播放歌曲后，自动加入后台缓存队列，"
-        f"搜索该歌曲的前20个版本（不限歌手）并缓存file_id。\n"
-        f"关闭后：不再自动缓存其他版本（已在队列中的任务仍会处理完）。"
+        f"开启后：用户播放歌曲后自动加入队列，后台搜索前20个版本并缓存。\n"
+        f"暂停后：新播放的歌曲仍会加入队列，但后台暂停处理，恢复后继续。"
     )
 
 
@@ -5110,6 +5109,13 @@ def main():
                             await asyncio.sleep(15)
                             continue
 
+                        # 取出后再次检查开关，关闭则放回队列并暂停
+                        if not autocache_song_enabled:
+                            await _loop.run_in_executor(_cache_executor, lambda: db.add_autocache_song_raw(member))
+                            logger.info("自动缓存 ⏸️ 开关已关闭，任务放回队列，等待10秒...")
+                            await asyncio.sleep(10)
+                            continue
+
                         parts = member.split("||", 1)
                         song_name = parts[0]
                         song_artist = parts[1] if len(parts) > 1 else ""
@@ -5152,10 +5158,13 @@ def main():
                         if not to_cache:
                             continue
 
-                        # 缓存歌曲（每首间隔2秒，有用户活动则暂停，最多等60秒）
+                        # 缓存歌曲（每首间隔2秒，有用户活动则暂停，最多等60秒，开关关闭也暂停）
                         success = 0
                         failed = 0
                         for idx, song in enumerate(to_cache, 1):
+                            # 开关关闭时暂停
+                            while not autocache_song_enabled:
+                                await asyncio.sleep(5)
                             _song_wait = 0
                             while (time.time() - last_user_activity < 5 or inline_request_active > 0) and _song_wait < 60:
                                 await asyncio.sleep(5)

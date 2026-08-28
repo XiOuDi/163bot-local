@@ -465,6 +465,17 @@ class UpstashDB:
         self._exec("SADD", "autocache:song:queue", member)
         self._exec("SET", "autocache:song:active", "1", "EX", 86400)
 
+    def add_autocache_song_raw(self, member: str):
+        """将原始member（'歌名||歌手'格式）放回自动缓存队列"""
+        if member:
+            self._exec("SADD", "autocache:song:queue", member)
+            self._exec("SET", "autocache:song:active", "1", "EX", 86400)
+
+    def add_autocache_song_raw(self, member: str):
+        """直接添加原始member到自动缓存队列（用于暂停时放回队列）"""
+        self._exec("SADD", "autocache:song:queue", member)
+        self._exec("SET", "autocache:song:active", "1", "EX", 86400)
+
     def pop_autocache_song(self) -> str:
         """随机取出一个待自动缓存的歌曲，返回 '歌名||歌手' 或 None"""
         result = self._exec("SRANDMEMBER", "autocache:song:queue")
