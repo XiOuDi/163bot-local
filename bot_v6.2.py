@@ -259,8 +259,13 @@ inline_request_active = 0
 manual_cache_task = None   # 手动缓存任务（/cache 命令）
 auto_cache_task = None     # 闲时自动缓存任务
 
-# 用户播放自动缓存其他版本开关（默认开启）
+# 用户播放自动缓存其他版本开关（默认开启，从Upstash持久化加载）
 autocache_song_enabled = True
+try:
+    autocache_song_enabled = db.get_autocache_song_enabled()
+    logger.info(f"自动缓存其他版本开关: {'开启' if autocache_song_enabled else '关闭'}（从数据库加载）")
+except Exception:
+    pass
 
 # 搜索播放活动集合（优先级控制：用户搜索播放时暂停歌单播放）
 # 内联搜索 > 普通搜索 > 歌单播放 > 闲时缓存
@@ -3462,11 +3467,16 @@ async def cmd_togglesongcache(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("⛔ 权限不足。")
         return
     autocache_song_enabled = not autocache_song_enabled
+    try:
+        db.set_autocache_song_enabled(autocache_song_enabled)
+    except Exception:
+        pass
     status = "✅ 已开启" if autocache_song_enabled else "❌ 已暂停"
     await update.message.reply_text(
         f"🎵 用户播放自动缓存其他版本{status}\n\n"
         f"开启后：用户播放歌曲后自动加入队列，后台搜索前20个版本并缓存。\n"
-        f"暂停后：新播放的歌曲仍会加入队列，但后台暂停处理，恢复后继续。"
+        f"暂停后：新播放的歌曲仍会加入队列，但后台暂停处理，恢复后继续。\n"
+        f"（设置已保存，重启后保持）"
     )
 
 

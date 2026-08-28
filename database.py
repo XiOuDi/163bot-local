@@ -489,6 +489,17 @@ class UpstashDB:
         result = self._exec("SCARD", "autocache:song:queue")
         return int(result) if result else 0
 
+    def get_autocache_song_enabled(self) -> bool:
+        """获取自动缓存其他版本开关状态（默认开启）"""
+        result = self._exec("GET", "autocache:song:enabled")
+        if result is None:
+            return True
+        return str(result).lower() in ("1", "true", "yes", "on")
+
+    def set_autocache_song_enabled(self, enabled: bool):
+        """设置自动缓存其他版本开关状态（持久化）"""
+        self._exec("SET", "autocache:song:enabled", "1" if enabled else "0")
+
     def is_autocache_active(self) -> bool:
         """检查自动缓存任务是否活跃"""
         exists = self._exec("EXISTS", "autocache:song:active")
