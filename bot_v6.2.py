@@ -259,6 +259,9 @@ inline_request_active = 0
 manual_cache_task = None   # 手动缓存任务（/cache 命令）
 auto_cache_task = None     # 闲时自动缓存任务
 
+# 用户播放自动缓存其他版本开关（默认开启）
+autocache_song_enabled = True
+
 # 搜索播放活动集合（优先级控制：用户搜索播放时暂停歌单播放）
 # 内联搜索 > 普通搜索 > 歌单播放 > 闲时缓存
 active_search_plays = set()  # 当前正在进行搜索播放的用户ID集合
@@ -1913,7 +1916,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]])
         await query.edit_message_text(
             f"📊 缓存状态\n\n"
-            f"♻️ 自动缓存：{enabled}\n"
+            f"♻️ 闲时自动缓存：{enabled}\n"
+            f"🎵 播放后缓存其他版本：{'✅ 已开启' if autocache_song_enabled else '❌ 已关闭'}\n"
             f"🔄 当前状态：{running}\n"
             f"📚 曲库榜单：{len(AUTO_CACHE_PLAYLISTS)} 个\n"
             f"💾 已缓存歌曲：{cached_count} 首\n"
@@ -2865,6 +2869,7 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⏹️ /playliststop — 查看/停止正在播放歌单的用户\n"
         "🔀 /toggleplaylist — 开关歌单播放功能\n"
         "♻️ /autocache — 开关闲时自动缓存\n"
+        "🎵 /togglesongcache — 开关用户播放后自动缓存其他版本\n"
         "📊 /cachestatus — 查看缓存状态（含立即缓存按钮）\n"
         "🔄 /refreshcache — 手动更新闲时缓存歌单（清除今日标记并重新缓存）\n\n"
         "👑 <b>管理员管理</b>（仅主管理员）\n"
@@ -3449,6 +3454,23 @@ async def cmd_autocache(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"♻️ 闲时自动缓存{status}\n\n空闲5分钟无用户活动时自动缓存多榜单曲库（{len(AUTO_CACHE_PLAYLISTS)}个排行榜），有用户请求时立即暂停。")
 
 
+async def cmd_togglesongcache(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """管理员：开关用户播放后自动缓存其他版本"""
+    global autocache_song_enabled
+    user = update.effective_user
+    if not _is_admin(user.id):
+        await update.message.reply_text("⛔ 权限不足。")
+        return
+    autocache_song_enabled = not autocache_song_enabled
+    status = "✅ 已开启" if autocache_song_enabled else "❌ 已关闭"
+    await update.message.reply_text(
+        f"🎵 用户播放自动缓存其他版本{status}\n\n"
+        f"开启后：用户通过任何方式播放歌曲后，自动加入后台缓存队列，"
+        f"搜索该歌曲的前20个版本（不限歌手）并缓存file_id。\n"
+        f"关闭后：不再自动缓存其他版本（已在队列中的任务仍会处理完）。"
+    )
+
+
 async def cmd_cachestatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """管理员：查看缓存状态"""
     user = update.effective_user
@@ -3473,7 +3495,8 @@ async def cmd_cachestatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]])
     await update.message.reply_text(
         f"📊 缓存状态\n\n"
-        f"♻️ 自动缓存：{enabled}\n"
+        f"♻️ 闲时自动缓存：{enabled}\n"
+        f"🎵 播放后缓存其他版本：{'✅ 已开启' if autocache_song_enabled else '❌ 已关闭'}\n"
         f"🔄 当前状态：{running}\n"
         f"📚 曲库榜单：{len(AUTO_CACHE_PLAYLISTS)} 个\n"
         f"💾 已缓存歌曲：{cached_count} 首\n"
@@ -4334,6 +4357,7 @@ def main():
     application.add_handler(CommandHandler("restart", cmd_restart))
     application.add_handler(CommandHandler("cachetop", cmd_cachetop))
     application.add_handler(CommandHandler("autocache", cmd_autocache))
+    application.add_handler(CommandHandler("togglesongcache", cmd_togglesongcache))
     application.add_handler(CommandHandler("cachestatus", cmd_cachestatus))
     application.add_handler(CommandHandler("cacheplaylist", cmd_cacheplaylist))
     application.add_handler(CommandHandler("cachesame", cmd_cachesame))
@@ -5055,6 +5079,12 @@ def main():
                 _queue_wait_start = None  # 队列中有歌但被用户活动阻塞的开始时间
                 while True:
                     try:
+                        # 检查全局开关
+                        global autocache_song_enabled
+                        if not autocache_song_enabled:
+                            await asyncio.sleep(10)
+                            continue
+
                         # 有用户活动或内联请求时暂停（阈值从10秒缩短到5秒）
                         # 但如果队列等待超过60秒，强制处理（避免用户一直活跃导致永远不缓存）
                         _blocked = time.time() - last_user_activity < 5 or inline_request_active > 0
