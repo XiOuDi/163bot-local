@@ -123,7 +123,7 @@ def _print_banner():
     """打印启动横幅"""
     if not _USE_RICH:
         print("=" * 60)
-        print("  🎵 网易云音乐 Telegram Bot v8.1")
+        print("  🎵 网易云音乐 Telegram Bot v8.14")
         print("  💻 本地部署版")
         print("=" * 60)
         return
@@ -136,7 +136,7 @@ def _print_banner():
     # 主标题
     banner = Text()
     banner.append("🎵 网易云音乐 Telegram Bot\n", style="bold magenta")
-    banner.append("   v8.1 - 本地部署版", style="bold cyan")
+    banner.append("   v8.14 - 本地部署版", style="bold cyan")
 
     _console.print(Panel(Align.center(banner), border_style="magenta", padding=(1, 4)))
 
