@@ -377,6 +377,34 @@ def _fmt_duration(ms: int) -> str:
     return f"{sec // 60}:{sec % 60:02d}"
 
 
+def _extract_thread_id(update: Update):
+    """
+    从update中健壮地提取话题ID（message_thread_id）。
+    支持回调按钮、普通消息、话题群组。
+    只有 is_topic_message=True 时才返回thread_id，普通群/General话题返回None。
+    """
+    msg = None
+    if update.callback_query is not None:
+        msg = update.callback_query.message
+    elif update.message is not None:
+        msg = update.message
+    elif update.effective_message is not None:
+        msg = update.effective_message
+    if msg is None:
+        return None
+    tid = getattr(msg, "message_thread_id", None)
+    is_topic = getattr(msg, "is_topic_message", False)
+    # 权威判断：消息本身标记为话题消息
+    if is_topic and tid:
+        return tid
+    # 兜底：所在聊天是论坛超级群组且消息带thread_id（防止is_topic_message字段缺失）
+    chat = getattr(msg, "chat", None)
+    is_forum = getattr(chat, "is_forum", False) if chat else False
+    if is_forum and tid:
+        return tid
+    return None
+
+
 def _is_wrong_audio_title(actual_title: str, expected_name: str, song_id: int) -> bool:
     """
     检测音频标题是否不正确（需要删除file_id缓存并重新上传）
@@ -942,13 +970,17 @@ async def _render_search_page(update: Update, context: ContextTypes.DEFAULT_TYPE
     end = min(start + page_size, total)
     page_songs = songs[start:end]
 
+    # 提取当前话题ID并编码进按钮回调，确保任何成员点击都在同一话题回复
+    _tid = _extract_thread_id(update)
+    _tid_suffix = f":{_tid}" if _tid else ""
+
     # 构建歌曲按钮
     keyboard = []
     for i, song in enumerate(page_songs):
         idx = start + i + 1
         label = f"{idx}. {song['name']} - {song['artist']} ({_fmt_duration(song['duration'])})"
         keyboard.append([
-            InlineKeyboardButton(label, callback_data=f"play:{song['id']}")
+            InlineKeyboardButton(label, callback_data=f"play:{song['id']}{_tid_suffix}")
         ])
 
     # 分页导航按钮
@@ -1819,8 +1851,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = query.data
     if data.startswith("play:"):
-        song_id = int(data.split(":", 1)[1])
-        await _play_song(update, context, song_id, edit=True)
+        parts = data.split(":")
+        song_id = int(parts[1])
+        # 可选第3段：编码的话题ID（确保其他成员点击也在同一话题回复）
+        thread_override = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
+        await _play_song(update, context, song_id, edit=True, thread_id_override=thread_override)
     elif data.startswith("searchpage:"):
         page = int(data.split(":", 1)[1])
         await _render_search_page(update, context, page)
@@ -1932,7 +1967,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-async def _play_song(update: Update, context: ContextTypes.DEFAULT_TYPE, song_id: int, edit: bool = False):
+async def _play_song(update: Update, context: ContextTypes.DEFAULT_TYPE, song_id: int, edit: bool = False, thread_id_override=None):
     """获取歌曲信息，下载音频并发送（私聊带歌词按钮，群组带在bot中播放按钮，支持话题群组）"""
     user = update.effective_user
     user_label = f"{user.username or user.first_name or user.id}"
@@ -1959,11 +1994,17 @@ async def _play_song(update: Update, context: ContextTypes.DEFAULT_TYPE, song_id
 
     # 获取 chat_id 和 message_thread_id（支持话题群组）
     if edit:
-        chat_id = update.callback_query.message.chat_id
-        message_thread_id = getattr(update.callback_query.message, 'message_thread_id', None)
+        cb_msg = update.callback_query.message
+        chat_id = cb_msg.chat_id
+        # 优先使用按钮回调中编码的话题ID（防止消息不可访问时丢失话题），否则从消息提取
+        message_thread_id = thread_id_override or _extract_thread_id(update)
+        logger.info(
+            f"播放歌曲 话题定位 chat={chat_id} override={thread_id_override} "
+            f"is_topic={getattr(cb_msg,'is_topic_message',None)} thread_id={message_thread_id}"
+        )
     else:
         chat_id = update.message.chat_id
-        message_thread_id = getattr(update.message, 'message_thread_id', None)
+        message_thread_id = thread_id_override or _extract_thread_id(update)
 
     # 获取歌曲详情
     try:
@@ -2059,7 +2100,10 @@ async def _play_song(update: Update, context: ContextTypes.DEFAULT_TYPE, song_id
                 # 标题正确，记录发送时间戳并返回
                 playlist_sent_songs[user.id][song_id] = time.time()
                 if edit:
-                    await update.callback_query.delete_message()
+                    try:
+                        await update.callback_query.delete_message()
+                    except Exception as del_e:
+                        logger.debug(f"删除搜索结果消息失败（可能已被删除）: {del_e}")
                 active_search_plays.discard(user.id)
                 logger.info(f"播放歌曲 ✅ 发送成功: {song['name']} - {song['artist']}")
                 # 用户播放后自动添加到缓存队列（后台缓存前20个版本，不限歌手）
@@ -2130,7 +2174,10 @@ async def _play_song(update: Update, context: ContextTypes.DEFAULT_TYPE, song_id
                 )
 
             if edit:
-                await update.callback_query.delete_message()
+                try:
+                    await update.callback_query.delete_message()
+                except Exception as del_e:
+                    logger.debug(f"删除搜索结果消息失败（可能已被删除）: {del_e}")
             if msg and msg.audio and msg.audio.file_id:
                 await asyncio.to_thread(db.set_file_id, song_id, msg.audio.file_id)
                 logger.info(f"播放歌曲 💾 file_id已保存: {song['name']}")
